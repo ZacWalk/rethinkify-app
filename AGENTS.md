@@ -5,8 +5,8 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 ## Non-negotiables
 
 1. **Windows-only code lives in the platform layer.** Everything in this repo talks to `pf::` abstractions declared in `platform.h`, which lives in the shared **platform-h** repository along with its Win32 implementation. No `windows.h` types, Win32 API calls, `HWND`/`HDC`, or Win32 constants anywhere in this repo. A change that needs a new OS capability goes into platform-h first, with its test in `tests/platform_tests.cpp` — then push it and bump `GIT_TAG` in `CMakeLists.txt`, or CI and a fresh clone build against the old revision. The other apps build against the same header, so a signature change breaks them until they bump their own pin.
-2. **Build with CMake + Ninja.** `.\dd.ps1 build -Config Debug`, or `cmake --preset debug && cmake --build --preset debug` from an x64 Developer PowerShell. platform-h is pulled in by `FetchContent`, preferring a sibling `..\platform-h` checkout when one exists — develop the two together there. Do not add other dependencies.
-3. **Run the tests.** `.\dd.ps1 test` (or `exe\rethinkify-64d.exe /test`) — exits 0 on success, 1 on any failure. Add a test in `tests.cpp` for every behaviour you fix, and run platform-h's own suite after touching it.
+2. **Build with CMake + Ninja.** In PowerShell 7.4+, use `.\dd.ps1 build debug` (`build` alone builds both configurations). The pinned shared dd driver and `dd.psd1` map to the existing CMake presets; keep the vendored runtime unmodified. platform-h is still owned by `CMakeLists.txt`, preferring a sibling `..\platform-h` checkout when one exists — develop the two together there. Do not add other dependencies.
+3. **Run the tests.** `.\dd.ps1 test --label unit` builds and runs the existing `/test` suite through CTest in both configurations without a GUI; unfiltered `test` also runs desktop smoke tests. The unit runner remains `exe\rethinkify-64d.exe /test` — exits 0 on success, 1 on any failure. Add a test in `tests.cpp` for every behaviour you fix, and run platform-h's own suite after touching it.
 4. **Optimise for small and fast.** This is the point of the project. Avoid per-keystroke or per-paint allocation, avoid O(document) work for a local edit, prefer `string_view` and reusable buffers. Delete dead code rather than leaving it.
 5. **Temporary files go in `tmp/`.**
 
@@ -33,7 +33,7 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 | Widgets | `ui.h` (colours, `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |
 | Utilities | `util.h`/`util.cpp` (string ops, colour), `json.h`/`json.cpp` (JSON DOM), `calc.h` (expression parser for Calculate Selection), `gitignore.h` (index filtering) |
 | Tests | `test.h` (assertions and runner), `tests.cpp` |
-| Build | `CMakeLists.txt` (declares the app with `platform_add_app()` — icon, manifest and version info are generated, so there is no `.rc`), `CMakePresets.json`, `dd.ps1`, `pch.h`, `targetver.h` |
+| Build | `CMakeLists.txt` (declares the app with `platform_add_app()` and registers its `/test` suite with CTest), `CMakePresets.json`, `dd.psd1` (project settings), `dd.ps1` / `.dd/` (unmodified shared driver, pin in `.dd/upstream.json`), `pch.h`, `targetver.h` |
 
 ## Adding a command
 
@@ -59,3 +59,24 @@ The two agent modes exist because `pf::run_ui` callbacks never drain under `/tes
 The platform layer only starts the process and moves bytes: `pf::spawn_child_process` creates the pipes, runs a reader thread per pipe, reassembles whole lines with `pf::line_splitter`, and delivers each one on the UI thread. It knows nothing of JSON, ACP or the transcript. Keep it that way — a protocol change must not reach `platform_win.cpp`.
 
 Above it, `child_transport` adapts `pf::child_process::write_line` to `acp::transport`, `acp::client` speaks the protocol, and `agent_host` owns the turn, the question queue and the permission prompts. The agent's file reads and writes go through `agent_host::events`, so they see unsaved work and land in the undo stack; both refuse a path that `pf::is_path_within` says is outside the root.
+
+## dd modes
+
+dd has two modes, and the command line selects between them.
+
+**CLI mode** is the default and the single behavior owner. Each verb runs once,
+prints one schema 1 result envelope and exits:
+
+```pwsh
+pwsh -NoProfile -File ./dd.ps1 test --json
+pwsh -NoProfile -File ./dd.ps1 build debug
+```
+
+**MCP mode** starts with `dd mcp`. The process becomes a stdio JSON-RPC server and
+stays alive until stdin closes, adapting typed MCP requests onto CLI mode — each
+tool call runs as a child `dd` invocation and returns that command's envelope.
+
+MCP mode owns stdout for protocol messages, so it prints no result envelope,
+rejects `--json`, and sends diagnostics to stderr. Its workspace boundary is the
+project root. Register the client configuration with `dd ide --mcp`; add
+`--allow-execution` only when project-code execution is intended.

@@ -1,9 +1,0 @@
-[submodule "dependencies/hunspell"]
-	path = dependencies/hunspell
-	url = https://github.com/ZacWalk/hunspell.git
-[submodule "dependencies/jsoncpp"]
-	path = dependencies/jsoncpp
-	url = https://github.com/ZacWalk/jsoncpp.git
-[submodule "dependencies/AStyle"]
-	path = dependencies/AStyle
-	url = https://github.com/ZacWalk/AStyle.git

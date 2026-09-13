@@ -128,3 +128,6 @@ public:
 		return run_all_result().output;
 	}
 };
+
+// Lives in tests_cpp.cpp, which holds the C++ tooling suites
+void register_cpp_tests(tests& suite);

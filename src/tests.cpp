@@ -45,6 +45,16 @@ static null_events null_ev;
 // stub_window_frame — No-op window for testing without a real platform window
 struct stub_window_frame final : pf::window_frame
 {
+	inline static const stub_window_frame* focused_window = nullptr;
+	std::vector<pf::menu_command> popup_items;
+	pf::ipoint popup_point;
+
+	~stub_window_frame() override
+	{
+		if (focused_window == this)
+			focused_window = nullptr;
+	}
+
 	void set_reactor(pf::frame_reactor_ptr) override
 	{
 	}
@@ -65,9 +75,10 @@ struct stub_window_frame final : pf::window_frame
 
 	void set_focus() override
 	{
+		focused_window = this;
 	}
 
-	bool has_focus() const override { return false; }
+	bool has_focus() const override { return focused_window == this; }
 
 	void set_capture() override
 	{
@@ -142,8 +153,10 @@ struct stub_window_frame final : pf::window_frame
 
 	std::unique_ptr<pf::measure_context> create_measure_context() const override { return nullptr; }
 
-	void show_popup_menu(const std::vector<pf::menu_command>&, const pf::ipoint&) override
+	void show_popup_menu(const std::vector<pf::menu_command>& items, const pf::ipoint& point) override
 	{
+		popup_items = items;
+		popup_point = point;
 	}
 
 	double get_dpi_scale() const override { return 1.0; }
@@ -4042,6 +4055,402 @@ static void should_route_agent_edits_through_the_document()
 	pf::platform_recycle_file(root);
 }
 
+static void should_build_the_tools_menu_from_the_script()
+{
+	const auto state = std::make_shared<app_state>(std::make_shared<sync_scheduler>());
+	state->_powershell = pf::file_path{R"(C:\pwsh.exe)"};
+	state->_script_path = pf::file_path{R"(C:\root\dd.ps1)"};
+	state->_script.commands = {"run", "build", "clean"};
+	state->_script.options = {{"Config", {"Debug", "Release"}}};
+
+	const auto items = state->build_tools_menu();
+
+	should::is_equal(size_t{11}, items.size(), "three commands, the option submenu, and the fixed items");
+	should::is_equal("run", items[0].text);
+	should::is_equal("clean", items[2].text);
+	should::is_equal("Config", items[4].text);
+	should::is_equal(size_t{2}, items[4].children.size());
+	should::is_equal_true(items[4].children[0].is_checked(), "the first value is the default");
+	should::is_equal(false, items[4].children[1].is_checked(), "and only one is checked");
+}
+
+static void should_offer_no_tools_without_a_script()
+{
+	const auto state = std::make_shared<app_state>(std::make_shared<sync_scheduler>());
+	const auto items = state->build_tools_menu();
+
+	should::is_equal(size_t{7}, items.size());
+	should::is_equal_true(items[0].text.starts_with("(No dd.ps1"), "it says why");
+	should::is_equal(false, items[0].is_enabled(), "and is disabled");
+}
+
+static void should_step_through_diagnostics()
+{
+	using state = app_state;
+
+	should::is_equal(-1, state::step_diagnostic_index(0, -1, 1), "nothing to visit");
+	should::is_equal(0, state::step_diagnostic_index(3, -1, 1), "forward starts at the first");
+	should::is_equal(2, state::step_diagnostic_index(3, -1, -1), "backward starts at the last");
+	should::is_equal(1, state::step_diagnostic_index(3, 0, 1));
+	should::is_equal(0, state::step_diagnostic_index(3, 2, 1), "and wraps round");
+	should::is_equal(2, state::step_diagnostic_index(3, 0, -1), "in both directions");
+}
+
+static void should_resolve_a_diagnostic_path()
+{
+	const pf::file_path root{R"(C:\root)"};
+
+	should::is_equal(R"(C:\root\src\a.cpp)",
+	                 app_state::resolve_diagnostic_path(root, "src/a.cpp").view(),
+	                 "a relative path is rooted at the working directory");
+	should::is_equal(R"(D:\other\b.cpp)",
+	                 app_state::resolve_diagnostic_path(root, R"(D:\other\b.cpp)").view(),
+	                 "an absolute path is left alone");
+	should::is_equal(R"(\\server\share\c.cpp)",
+	                 app_state::resolve_diagnostic_path(root, R"(\\server\share\c.cpp)").view(),
+	                 "and so is a UNC path");
+	should::is_equal_true(app_state::resolve_diagnostic_path(root, "").empty(), "no file, no path");
+	should::is_equal_true(app_state::resolve_diagnostic_path({}, "a.cpp").empty(), "nor without a root");
+}
+
+static void should_recognise_indexable_sources()
+{
+	should::is_equal_true(app_state::is_indexable_source(R"(C:\a\b.cpp)"), "a source file");
+	should::is_equal_true(app_state::is_indexable_source("b.H"), "case does not matter");
+	should::is_equal(false, app_state::is_indexable_source("readme.md"), "markdown is not C++");
+	should::is_equal(false, app_state::is_indexable_source("Makefile"), "nor a file with no extension");
+	should::is_equal(false, app_state::is_indexable_source(R"(C:\a.h\b)"), "a dot in a folder is not one");
+}
+
+static void should_name_the_header_and_source_counterparts()
+{
+	const auto from_source = app_state::counterpart_names("app.cpp");
+	should::is_equal_true(!from_source.empty(), "a source file has counterparts");
+	should::is_equal("app.h", from_source[0], "the header is tried first");
+
+	const auto from_header = app_state::counterpart_names("app.h");
+	should::is_equal("app.cpp", from_header[0], "and the source from the header");
+	should::is_equal_true(std::ranges::find(from_header, "app.ixx") != from_header.end(),
+		"module interfaces are also sources");
+
+	should::is_equal_true(app_state::counterpart_names("Makefile").empty(), "no extension, no counterpart");
+}
+
+static void should_rank_a_definition_above_a_declaration()
+{
+	const auto state = std::make_shared<app_state>(std::make_shared<sync_scheduler>());
+	auto idx = std::make_shared<cpp::index>();
+
+	idx->update_file(idx->add_file("a.h"), "void f();");
+	idx->update_file(idx->add_file("b.cpp"), "void f() {}");
+	state->_cpp_index = idx;
+
+	const auto ranked = state->rank_candidates(idx->find("f"));
+	should::is_equal(size_t{2}, ranked.size(), "both are candidates");
+	should::is_equal_true((ranked[0].flags & cpp::symbol_flag::definition) != 0, "the definition comes first");
+}
+
+static void should_track_back_and_forward()
+{
+	const auto state = std::make_shared<app_state>(std::make_shared<sync_scheduler>());
+
+	should::is_equal(false, state->can_go_back(), "nowhere to go back to at first");
+	should::is_equal(false, state->can_go_forward());
+
+	state->go_back(); // reports, and does not reach for an empty stack
+
+	state->_active_item = std::make_shared<index_item>(pf::file_path{R"(C:\root\a.cpp)"}, "a.cpp", false, nullptr);
+	state->record_location();
+
+	should::is_equal_true(state->can_go_back(), "a jump remembers where it left");
+	should::is_equal(false, state->can_go_forward(), "and discards anything that was ahead");
+}
+
+static std::shared_ptr<app_state> create_navigation_app(
+	async_scheduler_ptr scheduler = std::make_shared<sync_scheduler>())
+{
+	const auto state = std::make_shared<app_state>(std::move(scheduler));
+	state->_app_window = std::make_shared<stub_window_frame>();
+	state->_doc_window = std::make_shared<stub_window_frame>();
+	state->_list_window = std::make_shared<stub_window_frame>();
+	state->_agent_window = std::make_shared<stub_window_frame>();
+	state->_agent_input_window = std::make_shared<stub_window_frame>();
+	state->set_root(std::make_shared<index_item>(pf::file_path{R"(C:\navigation-unit-tests)"}, "root", true));
+	state->_doc_window->set_focus();
+	return state;
+}
+
+static index_item_ptr add_navigation_document(const std::shared_ptr<app_state>& state,
+	const std::string_view name, const std::string_view text)
+{
+	const auto path = state->root_item()->path.combine(name);
+	const auto item = std::make_shared<index_item>(path, path.name(), false,
+		std::make_shared<document>(null_ev, text));
+	state->root_item()->children.push_back(item);
+	return item;
+}
+
+static void should_gate_navigation_to_the_cpp_editor()
+{
+	const auto state = create_navigation_app();
+	const auto item = add_navigation_document(state, "test.cpp", "void f();");
+	state->set_active_item(item);
+	const auto definition = state->command_menu_item(command_id::nav_go_to_definition);
+	const auto counterpart = state->command_menu_item(command_id::nav_switch_header_source);
+	should::is_equal_true(definition.is_enabled() && counterpart.is_enabled(), "C++ editor is enabled");
+	item->doc->read_only(true);
+	should::is_equal_true(definition.is_enabled(), "read-only source still supports navigation");
+
+	state->_list_window->set_focus();
+	should::is_equal(false, definition.is_enabled(), "file and search lists do not navigate an invisible caret");
+	state->_agent_visible = true;
+	state->_agent_input_window->set_focus();
+	should::is_equal(false, definition.is_enabled(), "agent input cannot navigate the editor");
+	state->_agent_window->set_focus();
+	should::is_equal(false, counterpart.is_enabled(), "nor the transcript");
+	state->_doc_window->set_focus();
+	state->set_mode(view_mode::markdown_files);
+	should::is_equal(false, definition.is_enabled(), "previews have no source caret");
+	state->set_active_item(add_navigation_document(state, "test.txt", "f"));
+	should::is_equal(false, counterpart.is_enabled(), "plain text is not a source file");
+	should::is_equal_true(app_state::counterpart_names("test.txt").empty(), "unsupported extension has no counterpart");
+}
+
+static void should_display_navigation_shortcuts_as_named_keys()
+{
+	for (unsigned int i = 0; i < 12; ++i)
+		should::is_equal(std::format("F{}", i + 1),
+			pf::format_key_binding({pf::platform_key::F1 + i, pf::key_mod::none}), "function key name");
+	should::is_equal("Ctrl+F12", pf::format_key_binding({pf::platform_key::F12, pf::key_mod::ctrl}));
+	should::is_equal("Shift+F8", pf::format_key_binding({pf::platform_key::F8, pf::key_mod::shift}));
+	should::is_equal("Alt+Left", pf::format_key_binding({pf::platform_key::Left, pf::key_mod::alt}));
+	should::is_equal("Alt+Right", pf::format_key_binding({pf::platform_key::Right, pf::key_mod::alt}));
+}
+
+class navigation_test_view final : public edit_doc_view
+{
+public:
+	using edit_doc_view::edit_doc_view;
+	using doc_view::text_to_client;
+};
+
+static void should_navigate_the_right_clicked_name_without_losing_copy_selection()
+{
+	const auto state = create_navigation_app();
+	const auto caller = add_navigation_document(state, "caller.cpp", "caf\xC3\xA9 target other");
+	const auto target = add_navigation_document(state, "target.cpp", "void target() {}");
+	state->set_active_item(caller);
+	state->_cpp_index = std::make_shared<cpp::index>();
+	state->reindex_open_documents();
+	const auto view = std::make_shared<navigation_test_view>(*state);
+	view->set_document(caller->doc);
+	state->_doc_view = view;
+	stub_measure_context measure;
+	view->handle_size(state->_doc_window, {480, 320}, measure);
+	caller->doc->select(caller->doc->all());
+	const auto selected = caller->doc->selection();
+	const auto point = view->text_to_client({7, 0});
+	state->_agent_visible = true;
+	state->_agent_input_window->set_focus();
+	pf::mouse_params params{};
+	params.point = point;
+	view->handle_mouse(state->_doc_window, pf::mouse_message_type::right_button_down, params);
+	should::is_equal_true(state->_doc_window->has_focus(), "right-click focuses its pane");
+	should::is_equal(selected._start.x, caller->doc->selection()._start.x, "copy selection start retained");
+	should::is_equal(selected._end.x, caller->doc->selection()._end.x, "copy selection end retained");
+	const auto menu = view->on_popup_menu(point);
+	const auto lookup = [&](const command_id id) -> const pf::menu_command&
+	{
+		const auto found = std::ranges::find_if(menu, [&](const pf::menu_command& command)
+		{
+			return command.id == static_cast<int>(id);
+		});
+		should::is_equal_true(found != menu.end(), "menu command exists");
+		return *found;
+	};
+	should::is_equal(static_cast<int>(pf::platform_key::F12),
+		static_cast<int>(lookup(command_id::nav_go_to_definition).accel.key),
+		"popup retains the command binding");
+	(void)lookup(command_id::nav_switch_header_source);
+	(void)lookup(command_id::edit_copy);
+	(void)lookup(command_id::edit_undo);
+	(void)lookup(command_id::edit_select_all);
+	lookup(command_id::nav_go_to_definition).action();
+	should::is_equal_true(state->active_item() == target, "clicked name wins over the caret at selection end");
+	should::is_equal("target", target->doc->copy(), "definition selected");
+	should::is_equal(7, state->_back.back().column, "history uses the clicked UTF-8 byte offset");
+
+	state->set_active_item(caller);
+	caller->doc->select(text_location{1, 0});
+	params.point = view->text_to_client({7, 0});
+	view->handle_mouse(state->_doc_window, pf::mouse_message_type::right_button_down, params);
+	should::is_equal(7, caller->doc->cursor_pos().x, "click outside selection moves to the UTF-8 byte target");
+	params.point = {-1, -1};
+	view->handle_mouse(state->_doc_window, pf::mouse_message_type::context_menu, params);
+	const auto window = std::static_pointer_cast<stub_window_frame>(state->_doc_window);
+	should::is_equal(static_cast<int>(command_id::nav_go_to_definition), window->popup_items.front().id,
+		"keyboard popup also offers navigation");
+	const auto caret_point = view->text_to_client(caller->doc->cursor_pos());
+	should::is_equal(caret_point.x, window->popup_point.x, "keyboard popup is positioned at the caret");
+	should::is_equal(caret_point.y, window->popup_point.y, "keyboard popup is positioned at the caret");
+	window->popup_items.front().action();
+	should::is_equal_true(state->active_item() == target, "keyboard popup uses the current caret");
+	state->_agent_input_window->set_focus();
+	const auto input_menu = state->_agent_input_view->on_popup_menu({});
+	should::is_equal(false, std::ranges::any_of(input_menu, [](const pf::menu_command& command)
+	{
+		return command.id == static_cast<int>(command_id::nav_go_to_definition);
+	}), "agent popup remains an editing menu");
+}
+
+static void should_cycle_definitions_without_reranking_the_destination_first()
+{
+	const auto state = create_navigation_app();
+	const auto a = add_navigation_document(state, "a.cpp", "void f() {}");
+	const auto b = add_navigation_document(state, "b.cpp", "void f() {}");
+	const auto c = add_navigation_document(state, "c.cpp", "void f() {}");
+	state->set_active_item(c);
+	c->doc->select(text_location{5, 0});
+	state->_cpp_index = std::make_shared<cpp::index>();
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == c, "current file wins first");
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == a, "next candidate");
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == b, "third candidate does not repeat the current file");
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == c, "cycle wraps");
+	c->doc->select(text_location{5, 0});
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == c, "moving the caret starts a fresh lookup");
+}
+
+static void should_refresh_unsaved_and_undone_inactive_sources()
+{
+	const auto state = create_navigation_app();
+	const auto header = add_navigation_document(state, "test.h", "void before();");
+	const auto caller = add_navigation_document(state, "test.cpp", "after");
+	state->set_active_item(caller);
+	state->_cpp_index = std::make_shared<cpp::index>();
+	state->reindex_open_documents();
+	{
+		undo_group group(header->doc);
+		header->doc->replace_text(group, header->doc->all(), "void after();");
+	}
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == header, "lookup sees an inactive unsaved declaration");
+	should::is_equal(size_t{0}, state->_cpp_index->find("before").size(), "old declaration removed");
+	header->doc->undo();
+	should::is_equal(false, header->doc->is_modified(), "undo reached saved text");
+	state->reindex_open_documents();
+	should::is_equal(size_t{1}, state->_cpp_index->find("before").size(), "clean undo updates the index");
+	should::is_equal(size_t{0}, state->_cpp_index->find("after").size(), "undone declaration removed");
+}
+
+static void should_discard_cpp_index_work_for_a_previous_root()
+{
+	const auto scheduler = std::make_shared<deferred_scheduler>();
+	const auto state = create_navigation_app(scheduler);
+	const auto old = add_navigation_document(state, "old.cpp", "void old_name();");
+	state->set_active_item(old);
+	state->record_location();
+	state->rebuild_cpp_index();
+	state->set_root(std::make_shared<index_item>(pf::file_path{R"(C:\another-navigation-root)"}, "next", true));
+	state->rebuild_cpp_index();
+	scheduler->pump();
+	should::is_equal_true(!state->_cpp_index, "empty new root cannot receive the previous worker result");
+	should::is_equal(false, state->can_go_back(), "old root history is cleared");
+
+	const auto fresh = add_navigation_document(state, "fresh.cpp", "void initial();");
+	state->rebuild_cpp_index();
+	{
+		undo_group group(fresh->doc);
+		fresh->doc->replace_text(group, fresh->doc->all(), "void latest();");
+	}
+	scheduler->pump();
+	should::is_equal(size_t{1}, state->_cpp_index->find("latest").size(), "publish merges current unsaved text");
+	should::is_equal(size_t{0}, state->_cpp_index->find("initial").size(), "stale snapshot cannot replace edits");
+}
+
+static void should_skip_stale_navigation_history_and_clamp_utf8_positions()
+{
+	const auto state = create_navigation_app();
+	const auto a = add_navigation_document(state, "a.cpp", "caf\xC3\xA9");
+	const auto b = add_navigation_document(state, "b.cpp", "void b();");
+	state->set_active_item(b);
+	state->_back = {{a->path, 100, 4}, {state->root_item()->path.combine("missing.cpp"), 0, 0}};
+	state->_list_window->set_focus();
+	state->go_back();
+	should::is_equal_true(state->active_item() == a, "stale entries are skipped");
+	should::is_equal_true(state->_doc_window->has_focus(), "history returns focus to the document");
+	should::is_equal(0, a->doc->cursor_pos().y, "line clamped after document shrinks");
+	should::is_equal(3, a->doc->cursor_pos().x, "column snaps to the UTF-8 leading byte");
+	should::is_equal(size_t{1}, state->_forward.size(), "only a successful jump adds forward history");
+	state->go_forward();
+	should::is_equal_true(state->active_item() == b, "forward restores the destination");
+	state->_forward.push_back({state->root_item()->path.combine("gone.cpp"), 0, 0});
+	const auto back_size = state->_back.size();
+	state->go_forward();
+	should::is_equal(back_size, state->_back.size(), "missing forward target adds no bogus back entry");
+}
+
+static void should_prefer_live_sibling_counterparts()
+{
+	const auto state = create_navigation_app();
+	const auto header = add_navigation_document(state, "test.h", "void f();");
+	const auto deleted = add_navigation_document(state, "test.cpp", "");
+	deleted->is_deleted = true;
+	const auto sibling = add_navigation_document(state, "test.cc", "void f() {}");
+	state->set_active_item(header);
+	state->switch_header_source();
+	should::is_equal_true(state->active_item() == sibling, "deleted preferred extension cannot hide a live sibling");
+	should::is_equal(size_t{1}, state->_back.size(), "switch records the source position");
+}
+
+static void should_navigate_utf16_sources_after_deferred_and_repeated_loads()
+{
+	const auto scratch = pf::current_directory().combine("tmp");
+	if (!scratch.exists())
+		pf::platform_create_directory(scratch);
+	const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto path = scratch.combine(std::format("cpp-navigation-{}.cpp", unique));
+	std::string encoded{"\xFF\xFE", 2};
+	for (const auto c : std::string_view("void loaded() {}\r\nvoid other() {}\r\n"))
+	{
+		encoded += c;
+		encoded += '\0';
+	}
+	write_test_text_file(path, encoded);
+
+	const auto scheduler = std::make_shared<deferred_scheduler>();
+	const auto state = create_navigation_app(scheduler);
+	state->set_root(std::make_shared<index_item>(scratch, scratch.name(), true));
+	const auto target = std::make_shared<index_item>(path, path.name(), false);
+	state->root_item()->children.push_back(target);
+	const auto caller = add_navigation_document(state, "caller.cpp", "loaded");
+	state->set_active_item(caller);
+	state->rebuild_cpp_index();
+	scheduler->pump();
+	should::is_equal(size_t{1}, state->_cpp_index->find("loaded").size(), "disk index decodes UTF-16");
+
+	state->go_to_definition();
+	scheduler->pump();
+	should::is_equal_true(state->active_item() == target, "deferred definition opens the target");
+	should::is_equal("loaded", target->doc->copy(), "symbol is selected after disk load");
+	should::is_equal_true(state->message_bar_text().find("loaded") != std::string_view::npos,
+		"load completion retains the navigation description");
+
+	state->set_active_item(caller);
+	target->doc.reset();
+	state->open_path_and_select(target, 0, 5, 6);
+	state->open_path_and_select(target, 1, 5, 5, "latest navigation");
+	scheduler->pump();
+	should::is_equal("other", target->doc->copy(), "newer jump waits for an already pending load");
+	should::is_equal(1, target->doc->selection()._start.y, "newer jump wins");
+	should::is_equal("latest navigation", state->message_bar_text(), "newer description wins too");
+	pf::platform_recycle_file(path);
+}
+
 tests::run_result run_all_tests_result(){
 	tests tests;
 
@@ -4298,6 +4707,39 @@ tests::run_result run_all_tests_result(){
 	tests.register_test("should splice wrap when an edit is undone", should_splice_wrap_when_an_edit_is_undone);
 	tests.register_test("should rewrap a dirty line that a later split moved",
 	                    should_rewrap_a_dirty_line_that_a_later_split_moved);
+
+	// Tools menu
+	tests.register_test("should build the tools menu from the script",
+	                    should_build_the_tools_menu_from_the_script);
+	tests.register_test("should offer no tools without a script", should_offer_no_tools_without_a_script);
+	tests.register_test("should step through diagnostics", should_step_through_diagnostics);
+	tests.register_test("should resolve a diagnostic path", should_resolve_a_diagnostic_path);
+
+	// Navigation
+	tests.register_test("should recognise indexable sources", should_recognise_indexable_sources);
+	tests.register_test("should name the header and source counterparts",
+	                    should_name_the_header_and_source_counterparts);
+	tests.register_test("should rank a definition above a declaration",
+	                    should_rank_a_definition_above_a_declaration);
+	tests.register_test("should track back and forward", should_track_back_and_forward);
+	tests.register_test("should gate navigation to the C++ editor", should_gate_navigation_to_the_cpp_editor);
+	tests.register_test("should display navigation shortcuts as named keys",
+		should_display_navigation_shortcuts_as_named_keys);
+	tests.register_test("should navigate the right-clicked name without losing copy selection",
+		should_navigate_the_right_clicked_name_without_losing_copy_selection);
+	tests.register_test("should cycle definitions without reranking the destination first",
+		should_cycle_definitions_without_reranking_the_destination_first);
+	tests.register_test("should refresh unsaved and undone inactive sources",
+		should_refresh_unsaved_and_undone_inactive_sources);
+	tests.register_test("should discard C++ index work for a previous root",
+		should_discard_cpp_index_work_for_a_previous_root);
+	tests.register_test("should skip stale navigation history and clamp UTF-8 positions",
+		should_skip_stale_navigation_history_and_clamp_utf8_positions);
+	tests.register_test("should prefer live sibling counterparts", should_prefer_live_sibling_counterparts);
+	tests.register_test("should navigate UTF-16 sources after deferred and repeated loads",
+		should_navigate_utf16_sources_after_deferred_and_repeated_loads);
+
+	register_cpp_tests(tests);
 
 	auto result = tests.run_all_result();
 	result.output = "# Test results\n\n" + result.output;

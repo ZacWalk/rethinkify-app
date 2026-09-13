@@ -321,6 +321,9 @@ namespace
 
 	constexpr int recent_root_folder_menu_id_base = 20000;
 
+	// Rebuilt with the Tools menu whenever the project model changes
+	constexpr int tool_menu_id_base = 21000;
+
 	std::string escape_menu_text(const std::string_view text)
 	{
 		return replace(std::string(text), "&", "&&");
@@ -652,23 +655,38 @@ void app_state::ensure_visible(const text_location& pt)
 void app_state::open_path_and_select(const index_item_ptr& item, const int line, const int col,
                                      const int length)
 {
-	load_doc(item, [this, item, line, col, length]
+	open_path_and_select(item, line, col, length, {});
+}
+
+void app_state::open_path_and_select(const index_item_ptr& item, const int line, const int col,
+                                     const int length, std::string message)
+{
+	load_doc(item, [this, item, line, col, length, message = std::move(message)]
 	{
 		const auto& d = item->doc;
-		if (!d || active_item() != item || line < 0 || line >= static_cast<int>(d->size()))
+		if (!d || active_item() != item || d->empty() || line < 0)
 			return;
 
-		const auto line_len = static_cast<int>((*d)[line].size());
-		const auto start = std::clamp(col, 0, line_len);
-		const auto end = std::clamp(col + length, start, line_len);
+		const auto row = std::min(line, static_cast<int>(d->size()) - 1);
+		std::string text;
+		(*d)[row].render(text);
+		const auto line_len = static_cast<int>(text.size());
+		auto start = std::clamp(col, 0, line_len);
+		auto end = start + std::clamp(length, 0, line_len - start);
+		if (start < line_len && pf::is_utf8_continuation(text[start]))
+			start = pf::utf8_prev(text, start);
+		if (end < line_len && pf::is_utf8_continuation(text[end]))
+			end = pf::utf8_prev(text, end);
 
 		// Scrolling to the match needs metrics for the document just loaded, not the one it replaced
 		_doc_view->layout();
 		_doc_view->recalc_vert_scrollbar();
 
-		d->select(text_selection(start, line, end, line));
-		ensure_visible(text_location(end, line)); // select() is a no-op when re-opening the same match
+		d->select(text_selection(start, row, end, row));
+		ensure_visible(text_location(end, row)); // select() is a no-op when re-opening the same match
 		invalidate(invalid::doc | invalid::doc_caret);
+		if (!message.empty())
+			set_message(message);
 	});
 }
 
@@ -713,7 +731,7 @@ void app_state::load_doc(const index_item_ptr& item, std::function<void()> on_lo
 
 		if (!changed_on_disk)
 		{
-			load_from_disk = false;
+			load_from_disk = disk_modified_time == 1 && !d->is_modified();
 		}
 		else if (d->is_modified())
 		{
@@ -1193,6 +1211,8 @@ void app_state::refresh_index(const pf::file_path& root_path, std::function<void
 				t->set_root(new_root);
 				t->note_content_changed();
 				t->remember_root_folder(t->root_item()->path);
+				t->discover_tools();
+				t->rebuild_cpp_index();
 				t->invalidate(invalid::files_layout | invalid::files_populate);
 
 				if (on_complete)
@@ -2318,6 +2338,640 @@ void app_state::update_recent_root_menu()
 {
 	if (_app_window)
 		_app_window->set_menu(build_menu());
+}
+
+//
+// Project tools
+//
+
+bool app_state::tools_busy() const
+{
+	return _tools && _tools->busy();
+}
+
+void app_state::discover_tools()
+{
+	const auto root = root_item();
+	const auto script = root && !root->path.empty() ? root->path.combine("dd.ps1") : pf::file_path{};
+
+	// Already read this one, so a plain folder refresh costs nothing
+	if (!script.empty() && script == _script_path && !_script.empty())
+		return;
+
+	_script = {};
+	_script_path = {};
+
+	if (script.empty() || !script.exists())
+		return;
+
+	if (_powershell.empty())
+	{
+		_powershell = pf::find_executable("pwsh");
+
+		if (_powershell.empty())
+			_powershell = pf::find_executable("powershell");
+	}
+
+	if (_powershell.empty())
+		return;
+
+	_script_path = script;
+	run_tool(tools::probe_script_command(_powershell, script));
+}
+
+void app_state::run_tool(tools::command cmd)
+{
+	if (!_tools)
+	{
+		_tools = std::make_unique<tools::runner>();
+		_tools->on_started = [this](const tools::command& started)
+		{
+			if (started.tag != "probe")
+				set_message(std::format("{}...", started.name));
+		};
+		_tools->on_output = [this](const std::string_view line)
+		{
+			if (_tools->current_requester() == tools::requester::user && !line.empty())
+				set_message(std::string(line));
+		};
+		_tools->on_finished = [this](const tools::result& result) { on_tool_finished(result); };
+	}
+
+	if (cmd.destructive)
+	{
+		const auto id = _app_window->message_box(std::format("Run '{}'?", cmd.name), g_app_name,
+		                                         pf::msg_box_style::yes_no | pf::msg_box_style::icon_question);
+
+		if (id != pf::msg_box_result::yes)
+			return;
+	}
+
+	// Save / discard / cancel, so a build never silently compiles stale text
+	if (cmd.tag != "probe" && !prompt_save_all_modified())
+		return;
+
+	if (_tools->queue(std::move(cmd)) == 0)
+		set_message("Too many tools are already waiting to run.");
+}
+
+void app_state::on_tool_finished(const tools::result& result)
+{
+	if (result.tag == "probe")
+	{
+		std::string reply;
+
+		for (const auto& line : result.output)
+			reply += line.text;
+
+		_script = tools::parse_script_interface(reply);
+		update_recent_root_menu();
+		return;
+	}
+
+	const auto errors = std::ranges::count(result.diagnostics, tools::severity::error, &tools::diagnostic::level);
+	const auto warnings = std::ranges::count(result.diagnostics, tools::severity::warning,
+	                                         &tools::diagnostic::level);
+
+	if (!result.started)
+		set_message(std::format("'{}' could not be started.", result.name));
+	else if (result.cancelled)
+		set_message(std::format("'{}' was stopped.", result.name));
+	else
+		set_message(std::format("'{}' finished with exit code {} — {} errors, {} warnings.",
+		                        result.name, result.exit_code, errors, warnings));
+
+	_diagnostics = result.diagnostics;
+	_diagnostics_root = pf::file_path{result.working_dir};
+	_diagnostic_index = -1;
+
+	show_generated_document(save_folder().combine("tool-output", "md"), tools::to_markdown(result));
+}
+
+int app_state::step_diagnostic_index(const int count, const int current, const int delta)
+{
+	if (count <= 0)
+		return -1;
+
+	if (current < 0)
+		return delta >= 0 ? 0 : count - 1;
+
+	return ((current + delta) % count + count) % count;
+}
+
+pf::file_path app_state::resolve_diagnostic_path(const pf::file_path& root, const std::string_view file)
+{
+	if (file.empty())
+		return {};
+
+	const auto absolute = (file.size() > 2 && file[1] == ':') || file.starts_with("\\\\") || file.starts_with("//");
+
+	if (absolute)
+		return pf::file_path{file};
+
+	return root.empty() ? pf::file_path{} : root.combine(file);
+}
+
+void app_state::go_to_diagnostic(const int delta)
+{
+	if (_diagnostics.empty())
+	{
+		set_message("No diagnostics. Run a build first.");
+		return;
+	}
+
+	_diagnostic_index = step_diagnostic_index(static_cast<int>(_diagnostics.size()), _diagnostic_index, delta);
+	const auto& d = _diagnostics[_diagnostic_index];
+
+	set_message(std::format("{}/{}: {}{}", _diagnostic_index + 1, _diagnostics.size(),
+	                        d.code.empty() ? std::string{} : d.code + " ", d.text));
+
+	// A linker error names an object file and no line, so there is nowhere to go
+	if (d.line <= 0)
+		return;
+
+	const auto path = resolve_diagnostic_path(_diagnostics_root, d.file);
+
+	if (path.empty() || !path.exists())
+		return;
+
+	const auto line = d.line - 1;
+	const auto column = std::max(d.column - 1, 0);
+
+	if (const auto item = find_item_recursively(root_item(), path))
+		open_path_and_select(item, line, column, 0);
+	else
+		load_doc(path);
+}
+
+//
+// C++ navigation
+//
+
+bool app_state::is_indexable_source(const std::string_view path)
+{
+	static const std::set<std::string_view, pf::iless> extensions = {
+		".h", ".hpp", ".hh", ".hxx", ".inl", ".c", ".cpp", ".cc", ".cxx", ".ixx",
+	};
+
+	const auto dot = path.find_last_of("./\\");
+	return dot != std::string_view::npos && path[dot] == '.' && extensions.contains(path.substr(dot));
+}
+
+static void collect_source_paths(const index_item_ptr& item, std::vector<pf::file_path>& out)
+{
+	if (!item)
+		return;
+
+	if (!item->is_folder && !item->is_deleted && app_state::is_indexable_source(item->path.view()))
+		out.push_back(item->path);
+
+	for (const auto& child : item->children)
+		collect_source_paths(child, out);
+}
+
+void app_state::rebuild_cpp_index()
+{
+	const auto generation = ++_cpp_index_generation;
+	std::vector<pf::file_path> paths;
+	collect_source_paths(root_item(), paths);
+
+	if (paths.empty())
+	{
+		_cpp_index.reset();
+		return;
+	}
+
+	_scheduler->run_async([t = shared_from_this(), generation, paths = std::move(paths)]
+	{
+		auto built = std::make_shared<cpp::index>();
+
+		for (const auto& path : paths)
+		{
+			const auto handle = pf::open_for_read(path);
+			if (!handle || handle->size() > max_indexed_source_size)
+				continue;
+
+			std::string source;
+			iterate_file_lines(handle, [&source](const std::string& line, int)
+			{
+				source += line;
+				source += '\n';
+			});
+
+			if (source.size() <= max_indexed_source_size)
+				built->update_file(built->add_file(path.view()), source);
+		}
+
+		t->_scheduler->run_ui([t, built, generation]
+		{
+			if (generation != t->_cpp_index_generation)
+				return;
+			t->_cpp_index = built;
+			t->_goto_word.clear();
+			t->reindex_open_documents();
+		});
+	});
+}
+
+void app_state::reindex_open_documents()
+{
+	if (!_cpp_index)
+		return;
+
+	const auto update = [&](const auto& self, const index_item_ptr& item) -> void
+	{
+		if (!item || item->is_deleted)
+			return;
+		if (!item->is_folder && item->doc && !item->doc->is_truncated() &&
+			(item->doc->disk_modified_time() != 1 || item->doc->is_modified()) &&
+			is_indexable_source(item->path.view()))
+		{
+			const auto source = item->doc->str();
+			if (source.size() <= max_indexed_source_size)
+				_cpp_index->update_file(_cpp_index->add_file(item->path.view()), source);
+		}
+		for (const auto& child : item->children)
+			self(self, child);
+	};
+	update(update, root_item());
+}
+
+bool app_state::can_navigate_cpp() const
+{
+	return _doc_window && _doc_window->has_focus() && is_edit_text(get_mode()) &&
+		_active_item && !_active_item->is_folder && !_active_item->is_deleted && doc() &&
+		doc()->encoding() != file_encoding::binary && is_indexable_source(_active_item->path.view());
+}
+
+std::string app_state::word_at_caret() const
+{
+	const auto d = doc();
+
+	if (!d || d->size() == 0)
+		return {};
+
+	const auto pos = d->cursor_pos();
+
+	if (pos.y < 0 || pos.y >= static_cast<int>(d->size()))
+		return {};
+
+	const auto sel = d->word_selection(pos, false);
+
+	if (sel._start.y != sel._end.y || sel._end.x <= sel._start.x)
+		return {};
+
+	std::string line;
+	(*d)[pos.y].render(line);
+
+	if (sel._end.x > static_cast<int>(line.size()))
+		return {};
+
+	auto word = line.substr(sel._start.x, static_cast<size_t>(sel._end.x - sel._start.x));
+	const auto first = static_cast<unsigned char>(word.empty() ? 0 : word.front());
+
+	// Punctuation and whitespace are words to the editor but not to the index
+	if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_' || first >= 0x80))
+		return {};
+
+	return word;
+}
+
+std::vector<cpp::symbol> app_state::rank_candidates(std::vector<cpp::symbol> found,
+                                                  const pf::file_path& preferred_file) const
+{
+	const auto item = active_item();
+	const auto path = preferred_file.empty() && item ? item->path : preferred_file;
+	const auto current_file = _cpp_index ? _cpp_index->find_file(path.view()) : 0;
+
+	const auto score = [&](const cpp::symbol& s)
+	{
+		auto value = 0;
+
+		if ((s.flags & cpp::symbol_flag::definition) != 0)
+			value += 8;
+
+		if (current_file != 0 && s.file == current_file)
+			value += 4;
+
+		if ((s.flags & cpp::symbol_flag::alternative_branch) != 0)
+			value -= 2;
+
+		// A type or a namespace is a more useful destination than a local variable
+		if (s.kind == cpp::symbol_kind::variable)
+			value -= 1;
+
+		return value;
+	};
+
+	std::ranges::stable_sort(found, [&](const cpp::symbol& a, const cpp::symbol& b)
+	{
+		if (score(a) != score(b))
+			return score(a) > score(b);
+		const auto order = pf::icmp(_cpp_index->file_path(a.file), _cpp_index->file_path(b.file));
+		if (order != 0)
+			return order < 0;
+		if (a.line != b.line)
+			return a.line < b.line;
+		return a.column < b.column;
+	});
+
+	return found;
+}
+
+std::string app_state::describe_symbol(const cpp::symbol& s) const
+{
+	const auto path = pf::file_path{_cpp_index->file_path(s.file)};
+	return std::format("{} {} — {}({})", cpp::to_string(s.kind), _cpp_index->qualified_name(s),
+	                   path.name(), s.line + 1);
+}
+
+void app_state::go_to_definition()
+{
+	if (!can_navigate_cpp())
+		return;
+
+	if (!_cpp_index)
+	{
+		set_message("No C++ index for this folder yet.");
+		return;
+	}
+
+	const auto word = word_at_caret();
+
+	if (word.empty())
+	{
+		set_message("Put the caret on a name first.");
+		return;
+	}
+
+	const auto pos = doc()->cursor_pos();
+	const bool continuing = word == _goto_word && active_item()->path == _goto_destination.path &&
+		pos == text_location{_goto_destination.column, _goto_destination.line};
+	if (!continuing)
+	{
+		_goto_origin = active_item()->path;
+		_goto_next = 0;
+	}
+	reindex_open_documents();
+	const auto found = rank_candidates(_cpp_index->find(word), _goto_origin);
+
+	if (found.empty())
+	{
+		set_message(std::format("No declaration of '{}' in this folder.", word));
+		return;
+	}
+
+	_goto_word = word;
+	const auto which = _goto_next % found.size();
+	_goto_next = which + 1;
+	const auto& target = found[which];
+	_goto_destination = {pf::file_path{_cpp_index->file_path(target.file)},
+		static_cast<int>(target.line), static_cast<int>(target.column + _cpp_index->name_of(target).size())};
+
+	record_location();
+	auto message = found.size() > 1
+		? std::format("{} of {}: {} — press again for the next", which + 1, found.size(),
+		              describe_symbol(found[which]))
+		: describe_symbol(found[which]);
+	go_to_symbol(found[which], std::move(message));
+}
+
+void app_state::go_to_symbol(const cpp::symbol& s, std::string message)
+{
+	const auto path = pf::file_path{_cpp_index->file_path(s.file)};
+
+	if (path.empty())
+		return;
+
+	const auto length = static_cast<int>(_cpp_index->name_of(s).size());
+
+	if (const auto item = find_item_recursively(root_item(), path))
+		open_path_and_select(item, static_cast<int>(s.line), static_cast<int>(s.column), length, std::move(message));
+	else if (path.exists())
+		load_doc(path);
+}
+
+std::vector<std::string> app_state::counterpart_names(const std::string_view name)
+{
+	const auto dot = name.find_last_of('.');
+
+	if (dot == std::string_view::npos || !is_indexable_source(name))
+		return {};
+
+	const auto stem = std::string(name.substr(0, dot));
+	const auto extension = name.substr(dot);
+
+	static const std::set<std::string_view, pf::iless> headers = {".h", ".hpp", ".hh", ".hxx"};
+	static constexpr std::string_view source_extensions[] = {".cpp", ".cc", ".cxx", ".c", ".inl", ".ixx"};
+	static constexpr std::string_view header_extensions[] = {".h", ".hpp", ".hh", ".hxx"};
+
+	const auto wanted = headers.contains(extension)
+		                    ? std::span<const std::string_view>(source_extensions)
+		                    : std::span<const std::string_view>(header_extensions);
+
+	std::vector<std::string> out;
+
+	for (const auto candidate : wanted)
+		out.push_back(stem + std::string(candidate));
+
+	return out;
+}
+
+static index_item_ptr find_item_by_name(const index_item_ptr& item, const std::string_view name)
+{
+	if (!item)
+		return {};
+
+	if (!item->is_folder && !item->is_deleted && pf::icmp(item->name, name) == 0)
+		return item;
+
+	for (const auto& child : item->children)
+		if (auto found = find_item_by_name(child, name))
+			return found;
+
+	return {};
+}
+
+void app_state::switch_header_source()
+{
+	if (!can_navigate_cpp())
+		return;
+
+	const auto item = active_item();
+
+	if (!item || item->path.empty())
+		return;
+
+	for (const auto& name : counterpart_names(item->path.name()))
+	{
+		// The sibling first, since that is nearly always the right one
+		if (const auto sibling = find_item_recursively(root_item(), item->path.folder().combine(name));
+			sibling && !sibling->is_folder && !sibling->is_deleted)
+		{
+			record_location();
+			load_doc(sibling);
+			return;
+		}
+	}
+
+	for (const auto& name : counterpart_names(item->path.name()))
+	{
+		if (const auto elsewhere = find_item_by_name(root_item(), name))
+		{
+			record_location();
+			load_doc(elsewhere);
+			return;
+		}
+	}
+
+	set_message(std::format("No counterpart for '{}'.", item->path.name()));
+}
+
+void app_state::record_location()
+{
+	const auto item = active_item();
+
+	if (!item || item->path.empty())
+		return;
+
+	const auto pos = doc() ? doc()->cursor_pos() : text_location{};
+	_back.push_back({item->path, pos.y, pos.x});
+	_forward.clear();
+
+	if (_back.size() > max_history)
+		_back.erase(_back.begin());
+}
+
+void app_state::go_back()
+{
+	while (!_back.empty())
+	{
+		const auto item = find_item_recursively(root_item(), _back.back().path);
+		if (item && !item->is_deleted && !item->is_folder)
+			break;
+		_back.pop_back();
+	}
+	if (_back.empty())
+	{
+		set_message("Nowhere to go back to.");
+		return;
+	}
+
+	if (const auto item = active_item(); item && !item->path.empty())
+	{
+		const auto pos = doc() ? doc()->cursor_pos() : text_location{};
+		_forward.push_back({item->path, pos.y, pos.x});
+	}
+
+	const auto entry = _back.back();
+	_back.pop_back();
+
+	if (const auto item = find_item_recursively(root_item(), entry.path))
+	{
+		set_focus(view_focus::text);
+		open_path_and_select(item, entry.line, entry.column, 0);
+	}
+}
+
+void app_state::go_forward()
+{
+	while (!_forward.empty())
+	{
+		const auto item = find_item_recursively(root_item(), _forward.back().path);
+		if (item && !item->is_deleted && !item->is_folder)
+			break;
+		_forward.pop_back();
+	}
+	if (_forward.empty())
+	{
+		set_message("Nowhere to go forward to.");
+		return;
+	}
+
+	if (const auto item = active_item(); item && !item->path.empty())
+	{
+		const auto pos = doc() ? doc()->cursor_pos() : text_location{};
+		_back.push_back({item->path, pos.y, pos.x});
+	}
+
+	const auto entry = _forward.back();
+	_forward.pop_back();
+
+	if (const auto item = find_item_recursively(root_item(), entry.path))
+	{
+		set_focus(view_focus::text);
+		open_path_and_select(item, entry.line, entry.column, 0);
+	}
+}
+
+std::vector<pf::menu_command> app_state::build_tools_menu()
+{
+	using cid = command_id;
+
+	std::vector<pf::menu_command> items;
+	auto next_id = tool_menu_id_base;
+
+	if (_script_path.empty())
+	{
+		items.emplace_back("(No dd.ps1 in this folder)", 0, nullptr, [] { return false; });
+	}
+	else
+	{
+		for (const auto& name : _script.commands)
+		{
+			const auto destructive = name == "clean";
+
+			items.emplace_back(
+				escape_menu_text(name), next_id++,
+				[this, name, destructive]
+				{
+					std::vector<tools::script_argument> arguments;
+
+					for (const auto& option : _script.options)
+						if (const auto chosen = _script_choices.find(option.name);
+							chosen != _script_choices.end())
+							arguments.push_back({option.name, chosen->second});
+
+					auto cmd = tools::script_command(_powershell, _script_path, name, arguments,
+					                                 _script_path.folder());
+					cmd.destructive = destructive;
+					run_tool(std::move(cmd));
+				},
+				[this] { return !tools_busy(); });
+		}
+
+		if (items.empty())
+			items.emplace_back("(dd.ps1 offers no commands)", 0, nullptr, [] { return false; });
+
+		for (const auto& option : _script.options)
+		{
+			std::vector<pf::menu_command> values;
+
+			for (const auto& value : option.values)
+			{
+				values.emplace_back(
+					escape_menu_text(value), next_id++,
+					[this, name = option.name, value] { _script_choices[name] = value; },
+					[this] { return !tools_busy(); },
+					[this, name = option.name, value, first = option.values.front()]
+					{
+						const auto chosen = _script_choices.find(name);
+						return chosen == _script_choices.end() ? value == first : chosen->second == value;
+					});
+			}
+
+			items.emplace_back(pf::menu_command{});
+			items.emplace_back(escape_menu_text(option.name), 0, nullptr, nullptr, nullptr, std::move(values));
+		}
+	}
+
+	items.emplace_back(pf::menu_command{});
+	items.emplace_back(command_menu_item(cid::tools_next_diagnostic));
+	items.emplace_back(command_menu_item(cid::tools_prev_diagnostic));
+	items.emplace_back(pf::menu_command{});
+	items.emplace_back(command_menu_item(cid::tools_stop));
+	items.emplace_back(command_menu_item(cid::tools_refresh));
+	return items;
 }
 
 std::vector<pf::menu_command> app_state::build_recent_root_folder_menu()

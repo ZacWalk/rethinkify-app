@@ -8,6 +8,8 @@
 #include "gitignore.h"
 #include "agent_session.h"
 #include "agent_host.h"
+#include "tool_runner.h"
+#include "cpp_index.h"
 #include "ui.h"
 
 
@@ -141,6 +143,87 @@ public:
 	std::vector<command_def> make_commands();
 	explicit app_state(async_scheduler_ptr scheduler);
 
+	//
+	// Project tools
+	//
+
+	std::unique_ptr<tools::runner> _tools;
+	tools::script_interface _script; // what the root's dd.ps1 offers
+	pf::file_path _script_path;
+	pf::file_path _powershell;
+
+	// Option name to the value last chosen, such as Config to Debug
+	std::map<std::string, std::string> _script_choices;
+
+	// What the last run reported, and where its relative paths are rooted
+	std::vector<tools::diagnostic> _diagnostics;
+	pf::file_path _diagnostics_root;
+	int _diagnostic_index = -1;
+
+	// Wraps in both directions; -1 means nothing has been visited yet
+	[[nodiscard]] static int step_diagnostic_index(int count, int current, int delta);
+
+	// Empty when the tool named no usable file, such as a linker error
+	[[nodiscard]] static pf::file_path resolve_diagnostic_path(const pf::file_path& root, std::string_view file);
+
+	void go_to_diagnostic(int delta);
+
+	//
+	// C++ navigation
+	//
+
+	// Replaced wholesale by the worker; only the UI thread reads or mutates it
+	std::shared_ptr<cpp::index> _cpp_index;
+	uint64_t _cpp_index_generation = 0;
+
+	// Where the last Go to Definition looked, so pressing it again offers the next
+	std::string _goto_word;
+	size_t _goto_next = 0;
+
+	struct visited_location
+	{
+		pf::file_path path;
+		int line = 0;
+		int column = 0;
+	};
+	pf::file_path _goto_origin;
+	visited_location _goto_destination;
+
+	static constexpr size_t max_history = 64;
+	static constexpr size_t max_indexed_source_size = 4 * 1024 * 1024;
+	std::vector<visited_location> _back;
+	std::vector<visited_location> _forward;
+
+	void rebuild_cpp_index();
+
+	// Resident documents, including undo back to saved text, override the disk index.
+	void reindex_open_documents();
+
+	[[nodiscard]] bool can_navigate_cpp() const;
+	[[nodiscard]] std::string word_at_caret() const;
+	[[nodiscard]] std::vector<cpp::symbol> rank_candidates(std::vector<cpp::symbol> found,
+	                                                     const pf::file_path& preferred_file = {}) const;
+	[[nodiscard]] std::string describe_symbol(const cpp::symbol& s) const;
+	void go_to_definition();
+	void go_to_symbol(const cpp::symbol& s, std::string message = {});
+	void switch_header_source();
+	void record_location();
+	void go_back();
+	void go_forward();
+	[[nodiscard]] bool can_go_back() const { return !_back.empty(); }
+	[[nodiscard]] bool can_go_forward() const { return !_forward.empty(); }
+
+	// 'a.cpp' to 'a.h' and back, trying the usual extensions in order
+	[[nodiscard]] static std::vector<std::string> counterpart_names(std::string_view name);
+	[[nodiscard]] static bool is_indexable_source(std::string_view path);
+
+	// Reads the root's helper script; does not run it, and does nothing without one
+	void discover_tools();
+	void run_tool(tools::command cmd);
+	void on_tool_finished(const tools::result& result);
+	[[nodiscard]] std::vector<pf::menu_command> build_tools_menu();
+	[[nodiscard]] bool tools_busy() const;
+
 	std::vector<pf::menu_command> build_menu();
 	pf::menu_command command_menu_item(command_id id,
 	                                   std::function<void()> action_override = nullptr,
@@ -163,6 +246,7 @@ public:
 
 	// The document may still be loading, so the match is selected from the load continuation
 	void open_path_and_select(const index_item_ptr& item, int line, int col, int length) override;
+	void open_path_and_select(const index_item_ptr& item, int line, int col, int length, std::string message);
 
 	void set_focus(view_focus v) override;
 
@@ -708,6 +792,14 @@ public:
 
 	void set_root(const index_item_ptr& root)
 	{
+		if (!_root_folder || !root || _root_folder->path != root->path)
+		{
+			_back.clear();
+			_forward.clear();
+		}
+		++_cpp_index_generation;
+		_cpp_index.reset();
+		_goto_word.clear();
 		_root_folder = root;
 
 		// Each folder has its own conversation, so the pane has to follow

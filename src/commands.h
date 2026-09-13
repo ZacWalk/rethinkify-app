@@ -79,6 +79,18 @@ enum class command_id : int
 	view_prev_result,
 	view_toggle_agent,
 	agent_focus_input,
+
+	// Tools
+	tools_stop,
+	tools_refresh,
+	tools_next_diagnostic,
+	tools_prev_diagnostic,
+
+	// Navigate
+	nav_go_to_definition,
+	nav_switch_header_source,
+	nav_back,
+	nav_forward,
 };
 
 class commands

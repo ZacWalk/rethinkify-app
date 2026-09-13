@@ -922,6 +922,7 @@ protected:
 
 	uint32_t on_right_button_down(pf::window_frame_ptr& window, const pf::ipoint& point)
 	{
+		window->set_focus();
 		if (!allows_drag_selection())
 			return 0;
 
@@ -1136,10 +1137,19 @@ protected:
 
 	void on_context_menu(const pf::window_frame_ptr& window, const pf::ipoint& screen_pt)
 	{
-		const auto client_pt = window->screen_to_client(screen_pt);
+		window->set_focus();
+		const bool from_keyboard = screen_pt.x == -1 && screen_pt.y == -1;
+		const auto client_pt = from_keyboard
+			? text_to_client(_doc->cursor_pos()) : window->screen_to_client(screen_pt);
+		auto popup_pt = screen_pt;
+		if (from_keyboard)
+		{
+			const auto origin = window->screen_to_client({});
+			popup_pt = {client_pt.x - origin.x, client_pt.y - origin.y};
+		}
 		const auto items = on_popup_menu(client_pt);
 		if (!items.empty())
-			window->show_popup_menu(items, screen_pt);
+			window->show_popup_menu(items, popup_pt);
 	}
 
 	virtual std::vector<pf::menu_command> on_popup_menu(const pf::ipoint& client_pt)

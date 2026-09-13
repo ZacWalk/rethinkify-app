@@ -2,9 +2,8 @@ name: Build
 
 on:
   push:
-    branches:
-      - master
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -14,8 +13,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # dd.ps1 locates Visual Studio, enters the MSVC environment and falls back
-      # to the CMake and Ninja that ship with it, so there is nothing to install.
+      # The pinned dd runtime sets up MSVC and uses the bundled CMake and Ninja.
+      # A CTest label skips dd's desktop smoke pass on the hosted runner.
       - name: Build and test
         shell: pwsh
-        run: .\dd.ps1 test -Config Debug
+        run: .\dd.ps1 test --label unit --non-interactive

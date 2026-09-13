@@ -28,7 +28,7 @@ endif()
 include(FetchContent)
 FetchContent_Declare(platform_h
     GIT_REPOSITORY https://github.com/ZacWalk/platform-h.git
-    GIT_TAG        09bcd03752df81cd85816a69589e1e4e19532002
+    GIT_TAG        894afaf337c722c4eafa0ec6b91fa6b83e06966e
 )
 FetchContent_MakeAvailable(platform_h)
 
@@ -40,10 +40,15 @@ platform_add_app(rethinkify
         src/app.cpp
         src/app_commands.cpp
         src/commands.cpp
+        src/cpp_index.cpp
+        src/cpp_lex.cpp
         src/document.cpp
         src/document_syntax.cpp
         src/json.cpp
         src/tests.cpp
+        src/tests_cpp.cpp
+        src/tool_output.cpp
+        src/tool_runner.cpp
         src/util.cpp
     ICON        src/res/app.ico
     DESCRIPTION "Rethinkify text editor"
@@ -67,3 +72,13 @@ set_target_properties(rethinkify PROPERTIES
 )
 
 target_precompile_headers(rethinkify PRIVATE src/pch.h)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_test(NAME rethinkify.unit COMMAND rethinkify /test)
+    set_tests_properties(rethinkify.unit PROPERTIES
+        LABELS "rethinkify;unit"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        TIMEOUT 120
+    )
+endif()

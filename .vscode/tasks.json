@@ -10,15 +10,15 @@
                 "-File",
                 "${workspaceFolder}/dd.ps1",
                 "build",
-                "-Config",
-                "Debug"
+                "debug"
             ],
+            "options": { "cwd": "${workspaceFolder}" },
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
             "problemMatcher": "$msCompile",
-            "detail": "CMake + Ninja via dd.ps1"
+            "detail": "Debug CMake + Ninja build via pinned dd"
         },
         {
             "label": "Build Rethinkify (Release)",
@@ -28,11 +28,13 @@
                 "-NoProfile",
                 "-File",
                 "${workspaceFolder}/dd.ps1",
-                "build"
+                "build",
+                "release"
             ],
+            "options": { "cwd": "${workspaceFolder}" },
             "group": "build",
             "problemMatcher": "$msCompile",
-            "detail": "CMake + Ninja via dd.ps1"
+            "detail": "Release CMake + Ninja build via pinned dd"
         },
         {
             "label": "Test Rethinkify",
@@ -42,13 +44,17 @@
                 "-NoProfile",
                 "-File",
                 "${workspaceFolder}/dd.ps1",
-                "test"
+                "test",
+                "--label",
+                "unit"
             ],
+            "options": { "cwd": "${workspaceFolder}" },
             "group": {
                 "kind": "test",
                 "isDefault": true
             },
-            "problemMatcher": []
+            "problemMatcher": "$msCompile",
+            "detail": "Build and run unit tests in Debug and Release without GUI smoke tests"
         }
     ]
 }

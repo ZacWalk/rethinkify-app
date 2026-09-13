@@ -23,6 +23,17 @@ json.* / util.* / calc.h        Leaf utilities
 
 The platform layer lives in the shared [platform-h](https://github.com/ZacWalk/platform-h) repository, pulled in by CMake and used by the other apps in the workspace. `platform.h` declares OS-free types (`window_frame`, `frame_reactor`, `draw_context`, `file_path`, …); `platform_win.cpp` is the only implementation. Nothing in this repo includes `windows.h`, and no OS parameter reaches it raw: the messages that carry data (`timer`, `dpi_changed`, `drop_files`) arrive as a decoded `pf::message_params`.
 
+### Build tooling
+
+The unmodified [dd v0.1.0](https://github.com/ZacWalk/dd/releases/tag/v0.1.0)
+runtime is vendored in `dd.ps1` and `.dd/`, with its upstream commit recorded
+in `.dd/upstream.json`. It is developer tooling, not an application dependency.
+`dd.psd1` maps the existing Debug/Release presets and executable paths; CMake
+continues to own the build graph and platform-h acquisition. CTest runs the
+existing executable's `/test` entry point, with the `unit` label letting CI
+skip dd's separate desktop smoke tests. No application code is changed by
+this integration.
+
 ### Threading
 
 One UI thread and one worker thread. `pf::run_async` queues work onto the worker; `pf::run_ui` marshals results back, waking the message loop through `MsgWaitForMultipleObjects`. Only two operations run off the UI thread — **folder indexing** and **search** — and both take a snapshot of what they need on the UI thread first. The worker never dereferences a live `index_item` or `document`.
@@ -190,6 +201,47 @@ Rethinkify advertises `fs/read_text_file` and `fs/write_text_file`, so an agent 
 | `/yolo` | Toggle running tools without asking |
 
 Anything else beginning with `/` is forwarded when the agent advertised it, and reported locally when it did not.
+
+## Project tools
+
+The **Tools** menu runs the root folder's `dd.ps1` and, later, CMake and the compiler. Nothing here is a linked dependency — they are the user's own toolchain, started with `pf::spawn_child_process` as an argument array, never as an assembled shell string, and never with `-ExecutionPolicy`. See [cpp.md](cpp.md) for the whole plan.
+
+The menu's contents come from the script rather than from a hard-coded list. When the index finishes, `discover_tools` asks PowerShell to parse `dd.ps1` with `Parser::ParseFile` and print the parameter AST as JSON — it *reads* the script, never runs it, so opening a folder can never execute anything. A first positional parameter's `ValidateSet` becomes the commands; any other parameter with a set becomes a submenu of choices. With no `dd.ps1` the menu says so and stays disabled.
+
+The shared dd driver used to build this repository has no such parameter
+block. Current discovery therefore falls back to **Run dd.ps1** (dd help);
+use PowerShell or VS Code tasks to build this repository until the editor
+supports the shared driver's manifest interface. Legacy script discovery
+is unchanged.
+
+`tools::runner` is the one execution path. A run produces a `tools::result` — command line, exit code, elapsed time, output with stderr identified per line, parsed diagnostics and failed targets. The generated `tool-output.md` document is one *rendering* of that value; the message bar and, later, the error list and MCP replies are others. Nothing exists only inside the document.
+
+Only one tool runs at a time, but a second request is **queued rather than refused**, carrying the identity of whoever asked, so a build an agent starts while the user's build is running waits its turn instead of silently doing nothing. Output is bounded — the first and last few thousand lines, with a count of what was dropped. A dirty document prompts save / discard / cancel before anything runs, and `clean` confirms every time.
+
+`tool_output.cpp` turns the merged stream into diagnostics: MSVC, clang, the linker, CMake's indented error blocks, Ninja progress and `FAILED:` targets, CTest failures and PowerShell error records. ANSI escapes are stripped first. A `note:` attaches to the diagnostic above it, as does the indented block under it — MSVC's `with [ _Ty=int ]` template context belongs to the note it follows, not to the file. A line that matches nothing is kept verbatim; nothing is ever dropped.
+
+`F8` and `Shift+F8` step through the last run's diagnostics, wrapping in both directions, opening each file and putting the caret on the reported line and column. A diagnostic that names no line — a linker error naming an object file — reports in the message bar and moves nothing.
+
+## C++ navigation
+
+Rethinkify parses C++ itself. `cpp_lex` produces a token stream — raw strings, line splices, directive continuations and all — and `cpp_index` walks it at declaration level, **skipping function bodies wholesale**, which is what makes it fast and what keeps it out of the hardest parts of the language. A symbol is name, scope, file, offset, line, column and kind; names and scopes are interned, and symbols are keyed by file so one file can be reparsed and spliced back. The whole of `src/` indexes at around 80 MB/s.
+
+The index is rebuilt on the worker thread after a folder refresh, from paths snapshotted on the UI thread. Source files are decoded to UTF-8, including UTF-16 input, so index positions match document byte coordinates. A generation check rejects results from an older refresh or root folder. Only the UI thread reads the published index; resident source documents override disk text when it is published and before a lookup, including unsaved edits and undo back to saved text.
+
+`F12` resolves the name at the caret, ranks the candidates — definitions before declarations, the current file before others, a type before a variable — and jumps to the best. Names resolve *lexically*, so an overload set is a set: pressing `F12` again on the same name offers the next candidate, and the message bar says which one of how many. That is the picker, without a popup. `Ctrl+F12` switches between a header and its source, preferring the sibling in the same folder. `Alt+Left` and `Alt+Right` walk two stacks of visited locations.
+
+Right-clicking C/C++ text focuses the editor and offers **Go to Definition** and
+**Switch Header/Source** alongside the usual editing commands. Definition lookup
+uses the clicked name even inside a selection; Copy keeps the original selection
+until a navigation command is chosen. Keyboard-opened context menus use the caret.
+These commands are available only in the focused C/C++ text view, including
+read-only source, not in previews, the file list, or the agent prompt.
+
+Candidate cycling retains the original file preference until the caret moves,
+so jumping into another file cannot reorder the next result. Navigation messages
+and selections are applied after asynchronous loading completes. Back/Forward
+skip deleted entries, clamp obsolete positions to valid UTF-8 boundaries, and
+reset when the root folder changes.
 
 ## Commands and keyboard
 

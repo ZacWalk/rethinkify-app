@@ -16,6 +16,7 @@ Still a work in progress. (for about 10 years)
 - **Multi-file search** — live search across the folder, grouped by file with highlighted matches (`Ctrl+Shift+F`)
 - **Four document views** — text, Markdown, CSV table and hex, chosen automatically and remembered per file
 - **Syntax highlighting** — C++, Rust, Python, PowerShell and Markdown
+- **C/C++ navigation** — go to definition (`F12`), switch header/source (`Ctrl+F12`), and navigation history (`Alt+Left` / `Alt+Right`), using a lightweight lexical index rather than a compiler
 - **Editing** — unlimited undo, word wrap, indent/unindent, spell check
 - **Coding agent** — talk to GitHub Copilot about the open folder (`Ctrl+Shift+A`, or `F4` to type)
 - **Utilities** — JSON reformat (`Ctrl+R`), sort and de-duplicate lines, evaluate a selected expression (`Ctrl+E`)
@@ -41,33 +42,28 @@ Nothing runs without your say-so: every tool the agent proposes is shown with it
 
 ## Building
 
-From an x64 Developer PowerShell:
+Requires Windows x64 and Visual Studio with the Desktop C++ workload. The
+vendored [dd](https://github.com/ZacWalk/dd) runtime locates Visual Studio and
+uses the CMake and Ninja that ship with it.
 
-```
-.\dd.ps1 build
-```
-
-`dd.ps1` locates Visual Studio, enters the MSVC environment and falls back to the
-CMake and Ninja that ship with it, so nothing extra needs installing. To drive
-CMake directly: `cmake --preset release && cmake --build --preset release`.
-
-The platform layer comes from the separate
-[platform-h](https://github.com/ZacWalk/platform-h) repository via `FetchContent`;
-a sibling `../platform-h` checkout is used automatically when present.
-
-Output is `exe\rethinkify-64.exe` (Release) or `exe\rethinkify-64d.exe` (Debug).
-
-## Testing
-
-```
-.\dd.ps1 test
+```powershell
+.\dd.ps1 build        # both configurations
+.\dd.ps1 test         # build and run the suite
+.\dd.ps1 launch       # build, then start a persistent app
 ```
 
-Runs the unit tests to stdout without starting the GUI, exiting 0 on success and 1 on any failure. The platform layer has its own suite in the platform-h repository.
+Output is `exe\rethinkify-64.exe`, or `rethinkify-64d.exe` for Debug. Neither
+`run` nor `launch` closes an already-running copy, so close the app before
+rebuilding its executable.
+
+The platform layer comes from [platform-h](https://github.com/ZacWalk/platform-h)
+via `FetchContent`; a sibling `../platform-h` checkout is used automatically
+when present.
 
 ## Documentation
 
 - [docs/design.md](docs/design.md) — architecture, views, keyboard reference and configuration
+- [docs/cpp.md](docs/cpp.md) — the lexical C/C++ index behind go-to-definition
 - [AGENTS.md](AGENTS.md) — conventions for contributors and coding agents
 
 ## License
