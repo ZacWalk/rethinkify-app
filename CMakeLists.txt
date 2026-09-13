@@ -28,7 +28,7 @@ endif()
 include(FetchContent)
 FetchContent_Declare(platform_h
     GIT_REPOSITORY https://github.com/ZacWalk/platform-h.git
-    GIT_TAG        8e9be5de233d1797ce7a2b50fe663042469611a9
+    GIT_TAG        894afaf337c722c4eafa0ec6b91fa6b83e06966e
 )
 FetchContent_MakeAvailable(platform_h)
 
@@ -63,3 +63,10 @@ set_target_properties(rethinkify PROPERTIES
 )
 
 target_precompile_headers(rethinkify PRIVATE src/pch.h)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(noterad_tests tests/smoke.cpp)
+    add_test(NAME noterad_unit COMMAND noterad_tests)
+    set_tests_properties(noterad_unit PROPERTIES TIMEOUT 30 LABELS noterad)
+endif()

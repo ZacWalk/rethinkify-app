@@ -5,7 +5,7 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 ## Non-negotiables
 
 1. **Windows-only code lives in the platform layer.** Everything in this repo talks to `pf::` abstractions declared in `platform.h`, which lives in the shared **platform-h** repository along with its Win32 implementation. No `windows.h` types, Win32 API calls, `HWND`/`HDC`, or Win32 constants anywhere in this repo. A change that needs a new OS capability goes into platform-h first, with its test in `tests/platform_tests.cpp` — then push it and bump `GIT_TAG` in `CMakeLists.txt`, or CI and a fresh clone build against the old revision. The other apps build against the same header, so a signature change breaks them until they bump their own pin.
-2. **Build with CMake + Ninja.** `.\dd.ps1 build -Config Debug`, or `cmake --preset debug && cmake --build --preset debug` from an x64 Developer PowerShell. platform-h is pulled in by `FetchContent`, preferring a sibling `..\platform-h` checkout when one exists — develop the two together there. Do not add other dependencies.
+2. **Build with CMake + Ninja.** `.\dd.ps1 build debug`, or `cmake --preset debug && cmake --build --preset debug` from an x64 Developer PowerShell. platform-h is pulled in by `FetchContent`, preferring a sibling `..\platform-h` checkout when one exists — develop the two together there. Do not add other dependencies.
 3. **Run the tests.** `.\dd.ps1 test` (or `exe\rethinkify-64d.exe /test`) — exits 0 on success, 1 on any failure. Add a test in `tests.cpp` for every behaviour you fix, and run platform-h's own suite after touching it.
 4. **Optimise for small and fast.** This is the point of the project. Avoid per-keystroke or per-paint allocation, avoid O(document) work for a local edit, prefer `string_view` and reusable buffers. Delete dead code rather than leaving it.
 5. **Temporary files go in `tmp/`.**
@@ -47,3 +47,25 @@ Global accelerators fire regardless of focus, so a command that acts on "the sel
 | `exe\rethinkify-64d.exe /spell:<word>` | Spell-checker diagnostics for `<word>`, no GUI |
 
 Both accept `/x` and `--x`. Neither writes configuration.
+
+## dd build system
+
+This repo uses the vendored dd build system. dd has two modes.
+
+**CLI mode** is the default; each verb runs once and exits:
+
+```pwsh
+.\dd.ps1 test                  # build both configs and run the suite
+.\dd.ps1 build debug
+.\dd.ps1 doctor --json
+.\dd.ps1 commands --json       # list this project's own commands
+```
+
+**MCP mode** — `.\dd.ps1 mcp` turns the process into a stdio JSON-RPC server for an
+MCP client, adapting typed requests onto CLI mode. It owns stdout for protocol
+messages, so it prints no result envelope and rejects `--json`. Register it with
+`.\dd.ps1 ide --mcp`.
+
+Project settings live in `dd.psd1`; dependency pins live in
+`cmake/dd-dependencies.json` with `dependencies.owner = 'dd'`. Vendored dd file
+hashes are recorded in `docs/dd-upstream.json`.

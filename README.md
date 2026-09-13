@@ -1,6 +1,6 @@
 # Rethinkify
 
-[![Build](https://github.com/ZacWalk/rethinkify-app/actions/workflows/build.yml/badge.svg)](https://github.com/ZacWalk/rethinkify-app/actions/workflows/build.yml)
+[![Build](https://github.com/ZacWalk/noterad/actions/workflows/build.yml/badge.svg)](https://github.com/ZacWalk/noterad/actions/workflows/build.yml)
 
 A lightweight Windows text editor for working across a folder full of notes, logs and data files. Point it at a folder, search everything in it, and read or edit whatever comes back.
 
@@ -24,29 +24,20 @@ Open documents are never closed behind your back: unsaved files stay in memory w
 
 ## Building
 
-From an x64 Developer PowerShell:
+Requires Windows x64 and Visual Studio with the Desktop C++ workload. The
+vendored [dd](https://github.com/ZacWalk/dd) runtime locates Visual Studio and
+uses the CMake and Ninja that ship with it.
 
-```
-.\dd.ps1 build
-```
-
-`dd.ps1` locates Visual Studio, enters the MSVC environment and falls back to the
-CMake and Ninja that ship with it, so nothing extra needs installing. To drive
-CMake directly: `cmake --preset release && cmake --build --preset release`.
-
-The platform layer comes from the separate
-[platform-h](https://github.com/ZacWalk/platform-h) repository via `FetchContent`;
-a sibling `../platform-h` checkout is used automatically when present.
-
-Output is `exe\rethinkify-64.exe` (Release) or `exe\rethinkify-64d.exe` (Debug).
-
-## Testing
-
-```
-.\dd.ps1 test
+```powershell
+.\dd.ps1 build        # both configurations
+.\dd.ps1 test         # build and run the suite
+.\dd.ps1 run          # build, then launch
 ```
 
-Runs the unit tests to stdout without starting the GUI, exiting 0 on success and 1 on any failure. The platform layer has its own suite in the platform-h repository.
+Output is `exe\rethinkify-64.exe`, or `rethinkify-64d.exe` for Debug. The
+platform layer comes from [platform-h](https://github.com/ZacWalk/platform-h) via
+`FetchContent`; a sibling `../platform-h` checkout is used automatically when
+present.
 
 ## Documentation
 
