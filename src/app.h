@@ -187,8 +187,11 @@ class document_events : public pf::ui::view_host
 public:
 	virtual void invalidate(uint32_t i) = 0;
 
-	// view_host's neutral spelling of "redraw everything about the document".
+	// view_host's neutral spelling of the repaint requests. The app keeps its
+	// coalescing bitmask; the shared views never see it.
 	void invalidate_view() override { invalidate(invalid::doc); }
+	void invalidate_caret() override { invalidate(invalid::doc_caret); }
+	void invalidate_scrollbar() override { invalidate(invalid::doc_scrollbar); }
 };
 
 // view_styles — the app's theme. The fonts, metrics and palette come from
