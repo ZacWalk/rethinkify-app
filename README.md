@@ -1,6 +1,6 @@
 # Rethinkify
 
-[![Build](https://github.com/ZacWalk/noterad/actions/workflows/build.yml/badge.svg)](https://github.com/ZacWalk/noterad/actions/workflows/build.yml)
+[![Build](https://github.com/ZacWalk/rethinkify-app/actions/workflows/build.yml/badge.svg)](https://github.com/ZacWalk/rethinkify-app/actions/workflows/build.yml)
 
 A lightweight Windows text editor for working across a folder full of notes, logs and data files. Point it at a folder, search everything in it, and read or edit whatever comes back.
 
@@ -16,11 +16,29 @@ Still a work in progress. (for about 10 years)
 - **Multi-file search** — live search across the folder, grouped by file with highlighted matches (`Ctrl+Shift+F`)
 - **Four document views** — text, Markdown, CSV table and hex, chosen automatically and remembered per file
 - **Syntax highlighting** — C++, Rust, Python, PowerShell and Markdown
+- **C/C++ navigation** — go to definition (`F12`), switch header/source (`Ctrl+F12`), and navigation history (`Alt+Left` / `Alt+Right`), using a lightweight lexical index rather than a compiler
 - **Editing** — unlimited undo, word wrap, indent/unindent, spell check
+- **Coding agent** — talk to GitHub Copilot about the open folder (`Ctrl+Shift+A`, or `F4` to type)
 - **Utilities** — JSON reformat (`Ctrl+R`), sort and de-duplicate lines, evaluate a selected expression (`Ctrl+E`)
 - **Session memory** — restores the recent root folders and the last document open in each
 
 Open documents are never closed behind your back: unsaved files stay in memory with their full undo history and are shown in red. You are prompted to save only when changing folder or exiting.
+
+## Agent
+
+The right-hand panel hosts a coding agent that can read and change the folder you have open. It needs [GitHub Copilot CLI](https://github.com/github/copilot-cli) installed and signed in; Rethinkify runs it as a child process and speaks the Agent Client Protocol to it.
+
+The conversation is not hidden in the application — it is `session.md` in the folder you opened. Open it, edit it, delete a turn that went wrong, and the agent carries on from what the file says. It survives restarts, one conversation per folder.
+
+Nothing runs without your say-so: every tool the agent proposes is shown with its exact command and numbered choices, and waits. `/yolo` turns that off for a session if you want it to get on with things, and is never restored automatically.
+
+| | |
+|---|---|
+| `/help`, `/h` | What you can type |
+| `/clear`, `/c` | Empty the conversation (`Ctrl+Z` brings it back) |
+| `/stop`, `/s` | Stop the current turn |
+| `/models`, `/m` | List models, or pick one |
+| `/yolo` | Run tools without asking |
 
 ## Building
 
@@ -31,17 +49,21 @@ uses the CMake and Ninja that ship with it.
 ```powershell
 .\dd.ps1 build        # both configurations
 .\dd.ps1 test         # build and run the suite
-.\dd.ps1 run          # build, then launch
+.\dd.ps1 launch       # build, then start a persistent app
 ```
 
-Output is `exe\rethinkify-64.exe`, or `rethinkify-64d.exe` for Debug. The
-platform layer comes from [platform-h](https://github.com/ZacWalk/platform-h) via
-`FetchContent`; a sibling `../platform-h` checkout is used automatically when
-present.
+Output is `exe\rethinkify-64.exe`, or `rethinkify-64d.exe` for Debug. Neither
+`run` nor `launch` closes an already-running copy, so close the app before
+rebuilding its executable.
+
+The platform layer comes from [platform-h](https://github.com/ZacWalk/platform-h)
+via `FetchContent`; a sibling `../platform-h` checkout is used automatically
+when present.
 
 ## Documentation
 
 - [docs/design.md](docs/design.md) — architecture, views, keyboard reference and configuration
+- [docs/cpp.md](docs/cpp.md) — the lexical C/C++ index behind go-to-definition
 - [AGENTS.md](AGENTS.md) — conventions for contributors and coding agents
 
 ## License

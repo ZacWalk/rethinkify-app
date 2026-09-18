@@ -107,30 +107,34 @@ std::vector<command_def> app_state::make_commands()
 		{
 			"Undo the last edit",
 			"&Undo", static_cast<int>(command_id::edit_undo), {'Z', pf::key_mod::ctrl},
-			[this] { return can_edit_document() && doc()->can_undo(); }, nullptr,
+			[this] { return can_edit_focused_document() && focused_document()->can_undo(); }, nullptr,
 			[this]
 			{
-				if (!doc()->can_undo())
+				const auto d = focused_document();
+
+				if (!d->can_undo())
 				{
 					set_message("Nothing to undo.");
 					return;
 				}
-				doc()->edit_undo();
+				d->edit_undo();
 			},
 			{pf::platform_key::Back, pf::key_mod::alt}
 		},
 		{
 			"Redo the last undone edit",
 			"&Redo", static_cast<int>(command_id::edit_redo), {'Y', pf::key_mod::ctrl},
-			[this] { return can_edit_document() && doc()->can_redo(); }, nullptr,
+			[this] { return can_edit_focused_document() && focused_document()->can_redo(); }, nullptr,
 			[this]
 			{
-				if (!doc()->can_redo())
+				const auto d = focused_document();
+
+				if (!d->can_redo())
 				{
 					set_message("Nothing to redo.");
 					return;
 				}
-				doc()->edit_redo();
+				d->edit_redo();
 			}
 		},
 		{
@@ -310,6 +314,20 @@ std::vector<command_def> app_state::make_commands()
 			[this] { return is_search(get_mode()); }, nullptr,
 			[this] { on_navigate_next(false); }
 		},
+		{
+			"Show or hide the agent panel",
+			"&Agent Panel", static_cast<int>(command_id::view_toggle_agent),
+			{'A', pf::key_mod::ctrl | pf::key_mod::shift},
+			nullptr, [this] { return _agent_visible; },
+			[this] { toggle_agent_panel(); }
+		},
+		{
+			"Type a message to the agent",
+			"&Message Agent", static_cast<int>(command_id::agent_focus_input),
+			{pf::platform_key::F4, pf::key_mod::none},
+			nullptr, nullptr,
+			[this] { focus_agent_input(); }
+		},
 
 		// ── Help ───────────────────────────────────────────────────────
 		{
@@ -323,6 +341,68 @@ std::vector<command_def> app_state::make_commands()
 			"&About", static_cast<int>(command_id::app_about), {pf::platform_key::F1, pf::key_mod::none},
 			nullptr, nullptr,
 			[this] { on_about(); }
+		},
+
+		// ── Tools ──────────────────────────────────────────────────────
+		{
+			"Stop the tool that is running",
+			"&Stop Running Tool", static_cast<int>(command_id::tools_stop), {},
+			[this] { return tools_busy(); }, nullptr,
+			[this] { if (_tools) _tools->stop_current(); }
+		},
+		{
+			"Re-read the commands the root folder's dd.ps1 offers",
+			"&Refresh Tools", static_cast<int>(command_id::tools_refresh), {},
+			[this] { return !tools_busy(); }, nullptr,
+			[this]
+			{
+				_script_path = {};
+				discover_tools();
+			}
+		},
+		{
+			"Go to the next error or warning from the last run",
+			"&Next Diagnostic", static_cast<int>(command_id::tools_next_diagnostic),
+			{pf::platform_key::F8, pf::key_mod::none},
+			[this] { return !_diagnostics.empty(); }, nullptr,
+			[this] { go_to_diagnostic(1); }
+		},
+		{
+			"Go to the previous error or warning from the last run",
+			"&Previous Diagnostic", static_cast<int>(command_id::tools_prev_diagnostic),
+			{pf::platform_key::F8, pf::key_mod::shift},
+			[this] { return !_diagnostics.empty(); }, nullptr,
+			[this] { go_to_diagnostic(-1); }
+		},
+
+		// ── Navigate ───────────────────────────────────────────────────
+		{
+			"Go to where the name at the caret is declared",
+			"Go to &Definition", static_cast<int>(command_id::nav_go_to_definition),
+			{pf::platform_key::F12, pf::key_mod::none},
+			[this] { return can_navigate_cpp(); }, nullptr,
+			[this] { go_to_definition(); }
+		},
+		{
+			"Switch between a header and its source file",
+			"Switch &Header/Source", static_cast<int>(command_id::nav_switch_header_source),
+			{pf::platform_key::F12, pf::key_mod::ctrl},
+			[this] { return can_navigate_cpp(); }, nullptr,
+			[this] { switch_header_source(); }
+		},
+		{
+			"Go back to where you were",
+			"&Back", static_cast<int>(command_id::nav_back),
+			{pf::platform_key::Left, pf::key_mod::alt},
+			[this] { return can_go_back(); }, nullptr,
+			[this] { go_back(); }
+		},
+		{
+			"Go forward again",
+			"&Forward", static_cast<int>(command_id::nav_forward),
+			{pf::platform_key::Right, pf::key_mod::alt},
+			[this] { return can_go_forward(); }, nullptr,
+			[this] { go_forward(); }
 		},
 	};
 	return defs;
@@ -415,11 +495,26 @@ std::vector<pf::menu_command> app_state::build_menu()
 				command_menu_item(cid::view_word_wrap),
 				command_menu_item(cid::view_toggle_markdown),
 				sep(),
+				command_menu_item(cid::view_toggle_agent),
+				command_menu_item(cid::agent_focus_input),
+				sep(),
 				command_menu_item(cid::view_refresh_folder),
 				sep(),
 				command_menu_item(cid::view_next_result),
 				command_menu_item(cid::view_prev_result),
 			}
+		},
+		{
+			"&Navigate", 0, nullptr, nullptr, nullptr, {
+				command_menu_item(cid::nav_go_to_definition),
+				command_menu_item(cid::nav_switch_header_source),
+				sep(),
+				command_menu_item(cid::nav_back),
+				command_menu_item(cid::nav_forward),
+			}
+		},
+		{
+			"&Tools", 0, nullptr, nullptr, nullptr, build_tools_menu()
 		},
 		{
 			"&Help", 0, nullptr, nullptr, nullptr, {

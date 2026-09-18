@@ -659,7 +659,7 @@ static bool is_rust_extension(const std::string_view ext)
 static bool is_cpp_extension(const std::string_view ext)
 {
 	static const std::set<std::string_view, pf::iless> extensions = {
-		"c", "cpp", "cxx", "cc", "h", "hh", "hpp", "hxx", "in"
+		"c", "cpp", "cxx", "cc", "h", "hh", "hpp", "hxx", "inl", "ixx", "in"
 	};
 
 	return extensions.contains(ext);

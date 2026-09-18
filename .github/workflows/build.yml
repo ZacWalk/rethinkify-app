@@ -18,16 +18,11 @@ jobs:
         with:
           persist-credentials: false
 
-      # The vendored dd runtime locates Visual Studio, enters the MSVC
-      # environment and uses the CMake and Ninja that ship with it.
-      - name: Validate pinned dependency declarations
-        shell: pwsh
-        run: ./dd.ps1 dep install --non-interactive
-
+      # The vendored dd runtime locates Visual Studio and uses its CMake and Ninja.
       - name: Check native toolchain
         shell: pwsh
         run: ./dd.ps1 doctor --non-interactive
 
       - name: Build and test Debug and Release
         shell: pwsh
-        run: ./dd.ps1 test --non-interactive
+        run: ./dd.ps1 test --label unit --non-interactive

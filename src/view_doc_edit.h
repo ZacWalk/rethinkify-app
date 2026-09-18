@@ -4,7 +4,7 @@
 
 #include "view_doc.h"
 
-class edit_doc_view final : public doc_view
+class edit_doc_view : public doc_view
 {
 public:
 	edit_doc_view(app_events& events) : doc_view(events)
@@ -18,6 +18,22 @@ public:
 	std::vector<pf::menu_command> on_popup_menu(const pf::ipoint& client_pt) override
 	{
 		std::vector<pf::menu_command> items;
+
+		const auto active = _events.active_item();
+		auto definition = _events.command_menu_item(command_id::nav_go_to_definition);
+		if (active && active->doc == _doc && definition.is_enabled && definition.is_enabled())
+		{
+			// Copy keeps the selection; navigation uses the name actually clicked within it.
+			const auto target = client_to_text(client_pt);
+			definition.action = [this, target, action = std::move(definition.action)]
+			{
+				_doc->select(target);
+				action();
+			};
+			items.push_back(std::move(definition));
+			items.push_back(_events.command_menu_item(command_id::nav_switch_header_source));
+			items.emplace_back();
+		}
 
 		// Spelling suggestions for the word under the cursor
 		if (_doc->spell_check())
@@ -138,7 +154,6 @@ protected:
 		}
 	}
 
-private:
 	bool on_key_down(pf::window_frame_ptr& window, const unsigned int vk) override
 	{
 		namespace pk = pf::platform_key;

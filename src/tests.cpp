@@ -1,4 +1,4 @@
-// tests.cpp — Unit tests for document editing, undo/redo, search, and utilities
+﻿// tests.cpp — Unit tests for document editing, undo/redo, search, and utilities
 
 #include "pch.h"
 #include "app.h"
@@ -6,7 +6,13 @@
 #include "app_state.h"
 #include "view_doc.h"
 #include "view_list_search.h"
+#include "view_agent.h"
+#include "view_agent_input.h"
+#include "agent_host.h"
 #include "calc.h"
+#include "json.h"
+#include "acp.h"
+#include "agent_session.h"
 #include "test.h"
 
 
@@ -39,6 +45,16 @@ static null_events null_ev;
 // stub_window_frame — No-op window for testing without a real platform window
 struct stub_window_frame final : pf::window_frame
 {
+	inline static const stub_window_frame* focused_window = nullptr;
+	std::vector<pf::menu_command> popup_items;
+	pf::ipoint popup_point;
+
+	~stub_window_frame() override
+	{
+		if (focused_window == this)
+			focused_window = nullptr;
+	}
+
 	void set_reactor(pf::frame_reactor_ptr) override
 	{
 	}
@@ -59,9 +75,10 @@ struct stub_window_frame final : pf::window_frame
 
 	void set_focus() override
 	{
+		focused_window = this;
 	}
 
-	bool has_focus() const override { return false; }
+	bool has_focus() const override { return focused_window == this; }
 
 	void set_capture() override
 	{
@@ -136,8 +153,10 @@ struct stub_window_frame final : pf::window_frame
 
 	std::unique_ptr<pf::measure_context> create_measure_context() const override { return nullptr; }
 
-	void show_popup_menu(const std::vector<pf::menu_command>&, const pf::ipoint&) override
+	void show_popup_menu(const std::vector<pf::menu_command>& items, const pf::ipoint& point) override
 	{
+		popup_items = items;
+		popup_point = point;
 	}
 
 	double get_dpi_scale() const override { return 1.0; }
@@ -2115,8 +2134,2324 @@ static void should_search_no_match()
 	should::is_equal(0, static_cast<int>(item->search_results.size()), "no match");
 }
 
-tests::run_result run_all_tests_result()
+static void should_json_round_trip()
 {
+	constexpr std::string_view text =
+		R"({"id":7,"ok":true,"none":null,"ratio":0.5,"tags":["a","b"],"nested":{"deep":[1,2,3]}})";
+
+	const auto parsed = json::parse(text);
+	should::is_equal_true(parsed.ok, "parsed");
+	should::is_equal(text, parsed.root.to_string(), "round trip");
+}
+
+static void should_json_read_members()
+{
+	const auto parsed = json::parse(R"({"jsonrpc":"2.0","id":42,"params":{"sessionId":"s1"}})");
+	should::is_equal_true(parsed.ok, "parsed");
+
+	const auto& root = parsed.root;
+	should::is_equal("2.0", root["jsonrpc"].text(), "string member");
+	should::is_equal(42, static_cast<int>(root["id"].integer()), "integer member");
+	should::is_equal("s1", root["params"]["sessionId"].text(), "nested member");
+	should::is_equal_true(root.contains("params"), "contains");
+	should::is_equal(size_t{3}, root.size(), "member count");
+}
+
+// Accessors are total so protocol handling never needs a type check before a read
+static void should_json_accessors_fall_back()
+{
+	const auto parsed = json::parse(R"({"n":1})");
+	should::is_equal_true(parsed.ok, "parsed");
+
+	const auto& root = parsed.root;
+	should::is_equal_true(root["missing"].is_null(), "missing key is null");
+	should::is_equal("fallback", root["missing"].text("fallback"), "missing text");
+	should::is_equal(9, static_cast<int>(root["missing"].integer(9)), "missing integer");
+	should::is_equal_true(root["n"].boolean(true), "wrong type keeps fallback");
+	should::is_equal("", root["n"].text(), "number as text is empty");
+	should::is_equal_true(root[7].is_null(), "index on object is null");
+}
+
+static void should_json_parse_escapes()
+{
+	const auto parsed = json::parse(R"(["a\"b","c\\d","e\/f","g\nh","\u0041\u00e9\u4e2d","\ud83d\ude00"])");
+	should::is_equal_true(parsed.ok, "parsed");
+
+	const auto& a = parsed.root;
+	should::is_equal("a\"b", a[0].text(), "quote");
+	should::is_equal("c\\d", a[1].text(), "backslash");
+	should::is_equal("e/f", a[2].text(), "solidus");
+	should::is_equal("g\nh", a[3].text(), "newline");
+	should::is_equal("A\xC3\xA9\xE4\xB8\xAD", a[4].text(), "bmp escapes as utf8");
+	should::is_equal("\xF0\x9F\x98\x80", a[5].text(), "surrogate pair as utf8");
+}
+
+// A lone surrogate cannot be encoded, so it becomes U+FFFD rather than failing the message
+static void should_json_replace_lone_surrogates()
+{
+	const auto lead = json::parse(R"(["\ud83d"])");
+	should::is_equal_true(lead.ok, "lead parsed");
+	should::is_equal("\xEF\xBF\xBD", lead.root[0].text(), "lone lead");
+
+	const auto trail = json::parse(R"(["\udc00"])");
+	should::is_equal_true(trail.ok, "trail parsed");
+	should::is_equal("\xEF\xBF\xBD", trail.root[0].text(), "lone trail");
+
+	const auto unpaired = json::parse(R"(["\ud83dZ"])");
+	should::is_equal_true(unpaired.ok, "unpaired parsed");
+	should::is_equal("\xEF\xBF\xBDZ", unpaired.root[0].text(), "lead then plain text");
+}
+
+// The transport is newline-delimited, so a serialised message must never contain a raw newline
+static void should_json_escape_control_characters()
+{
+	auto v = json::object();
+	v.set("text", std::string("line1\nline2\r\ttab\b\f\x01 end"));
+
+	const auto text = v.to_string();
+	should::is_equal(R"({"text":"line1\nline2\r\ttab\b\f\u0001 end"})", text, "escaped");
+	should::is_equal_true(text.find('\n') == std::string::npos, "no raw newline");
+
+	const auto parsed = json::parse(text);
+	should::is_equal_true(parsed.ok, "reparsed");
+	should::is_equal("line1\nline2\r\ttab\b\f\x01 end", parsed.root["text"].text(), "value survives");
+}
+
+static void should_json_keep_integers_exact()
+{
+	const auto parsed = json::parse(R"([0,-1,7,9007199254740993,-9007199254740993])");
+	should::is_equal_true(parsed.ok, "parsed");
+	should::is_equal("[0,-1,7,9007199254740993,-9007199254740993]", parsed.root.to_string(),
+	                 "large ids survive as integers");
+
+	const auto real = json::parse("1.5");
+	should::is_equal_true(real.ok, "real parsed");
+	should::is_equal("1.5", real.root.to_string(), "real round trip");
+
+	const auto exponent = json::parse("2e3");
+	should::is_equal_true(exponent.ok, "exponent parsed");
+	should::is_equal(2000, static_cast<int>(exponent.root.integer()), "exponent value");
+}
+
+static void should_json_reject_bad_numbers()
+{
+	constexpr std::string_view bad[] = {
+		"01", "-", "+1", ".5", "1.", "1.e3", "1e", "1e+", "--1", "0x10", "nan", "inf", "Infinity"
+	};
+
+	for (const auto& text : bad)
+	{
+		const auto parsed = json::parse(text);
+		should::is_equal(false, parsed.ok, std::format("rejects '{}'", text));
+	}
+
+	// Out of range rather than silently becoming infinity
+	should::is_equal(false, json::parse("1e309").ok, "rejects overflow");
+
+	// Too large for int64, so it degrades to a double rather than failing
+	const auto huge = json::parse("99999999999999999999");
+	should::is_equal_true(huge.ok, "huge parsed");
+	should::is_equal_true(huge.root.is_number(), "huge is number");
+}
+
+static void should_json_reject_malformed_input()
+{
+	constexpr std::string_view bad[] = {
+		"", "   ", "{", "}", "[", "]", "[1,]", "{\"a\":}", "{\"a\" 1}", "{a:1}", "{\"a\":1,}",
+		"\"unterminated", "\"bad\\escape\"", "tru", "nulll", "[1] extra", "{}{}", "\"\x01\""
+	};
+
+	for (const auto& text : bad)
+	{
+		const auto parsed = json::parse(text);
+		should::is_equal(false, parsed.ok, std::format("rejects '{}'", text));
+		should::is_equal_true(!parsed.error.empty(), "reports an error");
+		should::is_equal_true(parsed.root.is_null(), "yields null on failure");
+	}
+}
+
+// A hostile message must not be able to exhaust the stack
+static void should_json_limit_nesting_depth()
+{
+	const auto build = [](const int depth)
+	{
+		return std::string(depth, '[') + std::string(depth, ']');
+	};
+
+	should::is_equal_true(json::parse(build(json::max_parse_depth - 1)).ok, "accepts allowed depth");
+	should::is_equal(false, json::parse(build(json::max_parse_depth + 10)).ok, "rejects excessive depth");
+	should::is_equal(false, json::parse(build(10000)).ok, "rejects extreme depth");
+}
+
+static void should_json_build_messages()
+{
+	auto params = json::object();
+	params.set("sessionId", "abc");
+	params.set("prompt", json::array().add(json::object().set("type", "text").set("text", "hi")));
+
+	auto request = json::object();
+	request.set("jsonrpc", "2.0");
+	request.set("id", 1);
+	request.set("method", "session/prompt");
+	request.set("params", std::move(params));
+
+	should::is_equal(
+		R"({"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"abc","prompt":[{"type":"text","text":"hi"}]}})",
+		request.to_string(), "built message");
+}
+
+// Members keep insertion order, and a repeated key updates in place rather than appending
+static void should_json_replace_duplicate_keys()
+{
+	auto v = json::object();
+	v.set("a", 1);
+	v.set("b", 2);
+	v.set("a", 3);
+
+	should::is_equal(size_t{2}, v.size(), "no duplicate member");
+	should::is_equal(R"({"a":3,"b":2})", v.to_string(), "updated in place");
+
+	const auto parsed = json::parse(R"({"a":1,"a":2})");
+	should::is_equal_true(parsed.ok, "parsed");
+	should::is_equal(2, static_cast<int>(parsed.root["a"].integer()), "last wins");
+}
+
+static void should_json_pass_through_utf8()
+{
+	// U+00E9 arrives escaped, the rest as raw UTF-8 bytes
+	const std::string text = "{\"s\":\"\\u00e9 \xE4\xB8\xAD \xF0\x9F\x98\x80\"}";
+	const auto parsed = json::parse(text);
+	should::is_equal_true(parsed.ok, "parsed");
+
+	// Non-ASCII is emitted raw, not re-escaped
+	should::is_equal("{\"s\":\"\xC3\xA9 \xE4\xB8\xAD \xF0\x9F\x98\x80\"}", parsed.root.to_string(), "raw utf8 out");
+}
+
+// recording_transport — Captures what the client sends and lets a test reply as the agent
+struct recording_transport final : acp::transport
+{
+	std::vector<std::string> sent;
+	bool fail_sends = false;
+
+	bool send_line(const std::string_view line) override
+	{
+		if (fail_sends)
+			return false;
+
+		sent.emplace_back(line);
+		return true;
+	}
+
+	[[nodiscard]] json::value last() const
+	{
+		return sent.empty() ? json::value() : json::parse(sent.back()).root;
+	}
+
+	[[nodiscard]] json::value message(const size_t index) const
+	{
+		return index < sent.size() ? json::parse(sent[index]).root : json::value();
+	}
+
+	[[nodiscard]] int64_t last_id() const { return last()["id"].integer(); }
+};
+
+// Drives the handshake so a test can start from a ready session
+static void complete_handshake(acp::client& client, recording_transport& wire,
+                               const std::string_view session_id = "sess-1")
+{
+	client.start("C:\\work");
+
+	client.on_line(std::format(
+		R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true}}}}}})",
+		wire.last_id()));
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"{}"}}}})",
+	                           wire.last_id(), session_id));
+}
+
+static void should_acp_complete_handshake()
+{
+	recording_transport wire;
+	acp::client client(wire);
+
+	auto ready_count = 0;
+	client.on_ready = [&ready_count] { ++ready_count; };
+
+	client.start("C:\\work", {.read_text_file = true, .write_text_file = true});
+
+	const auto init = wire.message(0);
+	should::is_equal("2.0", init["jsonrpc"].text(), "jsonrpc version");
+	should::is_equal("initialize", init["method"].text(), "first method");
+	should::is_equal(acp::protocol_version, static_cast<int>(init["params"]["protocolVersion"].integer()),
+	                 "protocol version");
+	should::is_equal_true(init["params"]["clientCapabilities"]["fs"]["readTextFile"].boolean(),
+	                      "advertises reads");
+	should::is_equal(false, init["params"]["clientCapabilities"]["terminal"].boolean(true),
+	                 "declines terminal");
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                           init["id"].integer()));
+
+	const auto new_session = wire.message(1);
+	should::is_equal("session/new", new_session["method"].text(), "second method");
+	should::is_equal("C:\\work", new_session["params"]["cwd"].text(), "working directory");
+
+	should::is_equal(0, ready_count, "not ready until the session exists");
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"abc"}}}})",
+	                           new_session["id"].integer()));
+
+	should::is_equal(1, ready_count, "ready once");
+	should::is_equal_true(client.ready(), "state is ready");
+	should::is_equal("abc", client.session_id(), "session id");
+}
+
+static void should_acp_report_handshake_failure()
+{
+	recording_transport wire;
+	acp::client client(wire);
+
+	std::string reported;
+	client.on_error = [&reported](const std::string_view text) { reported = text; };
+
+	client.start("C:\\work");
+	client.on_line(std::format(
+		R"({{"jsonrpc":"2.0","id":{},"error":{{"code":-32000,"message":"not logged in"}}}})", wire.last_id()));
+
+	should::is_equal(false, client.ready(), "not ready");
+	should::is_equal_true(reported.find("not logged in") != std::string::npos, "reports the agent message");
+
+	// A session with no id is a failure even though the call succeeded
+	recording_transport wire2;
+	acp::client client2(wire2);
+	client2.on_error = [&reported](const std::string_view text) { reported = text; };
+	client2.start("C:\\work");
+	client2.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{}}}})", wire2.last_id()));
+	client2.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{}}}})", wire2.last_id()));
+
+	should::is_equal(false, client2.ready(), "no session id means not ready");
+}
+
+static void should_acp_send_prompt_and_end_turn()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	auto ended = 0;
+	auto reason = acp::stop_reason::unknown;
+	client.on_turn_end = [&](const acp::stop_reason r)
+	{
+		++ended;
+		reason = r;
+	};
+
+	should::is_equal_true(client.send_prompt("fix the bug"), "prompt sent");
+	should::is_equal_true(client.turn_in_flight(), "turn in flight");
+
+	const auto prompt = wire.last();
+	should::is_equal("session/prompt", prompt["method"].text(), "method");
+	should::is_equal("sess-1", prompt["params"]["sessionId"].text(), "session id");
+	should::is_equal("text", prompt["params"]["prompt"][0]["type"].text(), "content type");
+	should::is_equal("fix the bug", prompt["params"]["prompt"][0]["text"].text(), "content text");
+
+	// A second prompt is refused while one is in flight
+	should::is_equal(false, client.send_prompt("another"), "one turn at a time");
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})",
+	                           prompt["id"].integer()));
+
+	should::is_equal(1, ended, "turn ended once");
+	should::is_equal_true(reason == acp::stop_reason::end_turn, "end_turn");
+	should::is_equal(false, client.turn_in_flight(), "no longer in flight");
+	should::is_equal_true(client.send_prompt("another"), "next turn allowed");
+}
+
+static void should_acp_refuse_prompt_before_ready()
+{
+	recording_transport wire;
+	acp::client client(wire);
+
+	should::is_equal(false, client.send_prompt("too early"), "refused before start");
+	should::is_equal(size_t{0}, wire.sent.size(), "nothing sent");
+
+	client.start("C:\\work");
+	should::is_equal(false, client.send_prompt("still too early"), "refused mid handshake");
+	should::is_equal(size_t{1}, wire.sent.size(), "only the initialize");
+}
+
+static void should_acp_cancel_turn()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	client.cancel();
+	should::is_equal(size_t{2}, wire.sent.size(), "nothing to cancel");
+
+	should::is_equal_true(client.send_prompt("long task"), "prompt sent");
+	const auto prompt_id = wire.last_id();
+	client.cancel();
+	const auto cancel = wire.last();
+	should::is_equal("session/cancel", cancel["method"].text(), "cancel method");
+	should::is_equal("sess-1", cancel["params"]["sessionId"].text(), "cancel session");
+	should::is_equal_true(cancel["id"].is_null(), "cancel is a notification");
+
+	auto reason = acp::stop_reason::unknown;
+	client.on_turn_end = [&reason](const acp::stop_reason r) { reason = r; };
+
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"cancelled"}}}})", prompt_id));
+	should::is_equal_true(reason == acp::stop_reason::cancelled, "cancelled reason");
+}
+
+static void should_acp_dispatch_session_updates()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	std::vector<std::string> chunks;
+	client.on_session_update = [&chunks](const json::value& params)
+	{
+		chunks.emplace_back(params["update"]["content"]["text"].text());
+	};
+
+	client.on_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hel"}}}})");
+	client.on_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo"}}}})");
+
+	should::is_equal(size_t{2}, chunks.size(), "two chunks");
+	should::is_equal("Hel", chunks[0], "first chunk");
+	should::is_equal("lo", chunks[1], "second chunk");
+
+	// An unknown notification is ignored rather than treated as an error
+	auto errors = 0;
+	client.on_error = [&errors](std::string_view) { ++errors; };
+	client.on_line(R"({"jsonrpc":"2.0","method":"session/unheard_of","params":{}})");
+	should::is_equal(0, errors, "unknown notification ignored");
+}
+
+static void should_acp_answer_permission_requests()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	acp::request_id received = 0;
+	std::string tool;
+	client.on_permission_request = [&](const acp::request_id id, const json::value& params)
+	{
+		received = id;
+		tool = params["toolCall"]["title"].text();
+	};
+
+	client.on_line(
+		R"({"jsonrpc":"2.0","id":"req-7","method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"git status"},"options":[{"optionId":"allow","name":"Allow"}]}})");
+
+	should::is_equal_true(received != 0, "handler called");
+	should::is_equal("git status", tool, "tool title");
+	should::is_equal(size_t{1}, client.pending_reply_count(), "awaiting our answer");
+
+	auto outcome = json::object();
+	outcome.set("outcome", "selected");
+	outcome.set("optionId", "allow");
+	client.respond(received, json::object().set("outcome", std::move(outcome)));
+
+	const auto reply = wire.last();
+	should::is_equal("req-7", reply["id"].text(), "string id echoed verbatim");
+	should::is_equal("allow", reply["result"]["outcome"]["optionId"].text(), "selected option");
+	should::is_equal(size_t{0}, client.pending_reply_count(), "no longer awaiting");
+
+	// Answering twice sends nothing more
+	const auto count = wire.sent.size();
+	client.respond(received, json::object());
+	should::is_equal(count, wire.sent.size(), "second answer ignored");
+}
+
+// An unimplemented method must still get a reply, or the agent waits forever
+static void should_acp_reject_unknown_requests()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	client.on_line(R"({"jsonrpc":"2.0","id":31,"method":"terminal/create","params":{}})");
+
+	const auto reply = wire.last();
+	should::is_equal(31, static_cast<int>(reply["id"].integer()), "id echoed");
+	should::is_equal(acp::error_code::method_not_found, static_cast<int>(reply["error"]["code"].integer()),
+	                 "method not found");
+	should::is_equal_true(reply["error"]["message"].text().find("terminal/create") != std::string_view::npos,
+	                      "names the method");
+	should::is_equal(size_t{0}, client.pending_reply_count(), "nothing left outstanding");
+}
+
+static void should_acp_survive_malformed_input()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	std::vector<std::string> errors;
+	client.on_error = [&errors](const std::string_view text) { errors.emplace_back(text); };
+
+	client.on_line("");
+	client.on_line("   ");
+	should::is_equal(size_t{0}, errors.size(), "blank lines ignored");
+
+	client.on_line("{not json");
+	client.on_line("[1,2,3]");
+	client.on_line(R"({"jsonrpc":"2.0"})");
+	should::is_equal(size_t{3}, errors.size(), "each bad line reported once");
+
+	// A response to an id we never sent is ignored, not an error
+	client.on_line(R"({"jsonrpc":"2.0","id":9999,"result":{}})");
+	should::is_equal(size_t{3}, errors.size(), "stale response ignored");
+
+	// Still usable afterwards
+	should::is_equal_true(client.send_prompt("still working"), "client still usable");
+}
+
+static void should_acp_fail_pending_requests_on_disconnect()
+{
+	recording_transport wire;
+	acp::client client(wire);
+	complete_handshake(client, wire);
+
+	auto ended = 0;
+	auto reason = acp::stop_reason::unknown;
+	client.on_turn_end = [&](const acp::stop_reason r)
+	{
+		++ended;
+		reason = r;
+	};
+
+	should::is_equal_true(client.send_prompt("work"), "prompt sent");
+	should::is_equal(size_t{1}, client.pending_request_count(), "prompt pending");
+
+	client.on_disconnect("the agent stopped");
+
+	should::is_equal(1, ended, "turn ended");
+	should::is_equal_true(reason == acp::stop_reason::error, "ended with an error");
+	should::is_equal(size_t{0}, client.pending_request_count(), "nothing left pending");
+	should::is_equal(false, client.ready(), "not ready");
+	should::is_equal(false, client.turn_in_flight(), "no turn in flight");
+}
+
+static void should_acp_parse_stop_reasons()
+{
+	should::is_equal_true(acp::parse_stop_reason("end_turn") == acp::stop_reason::end_turn, "end_turn");
+	should::is_equal_true(acp::parse_stop_reason("cancelled") == acp::stop_reason::cancelled, "cancelled");
+	should::is_equal_true(acp::parse_stop_reason("refusal") == acp::stop_reason::refusal, "refusal");
+	should::is_equal_true(acp::parse_stop_reason("max_tokens") == acp::stop_reason::max_tokens, "max_tokens");
+	should::is_equal_true(acp::parse_stop_reason("something_new") == acp::stop_reason::unknown, "unknown");
+	should::is_equal("end_turn", acp::to_string(acp::stop_reason::end_turn), "to_string");
+}
+
+static constexpr std::string_view sample_session =
+	"<!-- rethinkify agent session v1 -->\n"
+	"\n"
+	"## Session\n"
+	"- model: claude-sonnet-4.5\n"
+	"- yolo: off\n"
+	"\n"
+	"## You\n"
+	"\n"
+	"Fix the wrap cache splice bug.\n"
+	"\n"
+	"## Agent\n"
+	"\n"
+	"The dirty range is still in the old numbering.\n"
+	"\n"
+	"### Tool: git status (approved)\n"
+	"\n"
+	"    M src/view_doc.h\n"
+	"\n"
+	"### Question: which file should I change?\n"
+	"\n"
+	"- [x] src/view_doc.h\n"
+	"- [ ] src/document.cpp\n";
+
+// The file is the transcript, so writing it back must not disturb a single byte
+static void should_session_round_trip_exactly()
+{
+	constexpr std::string_view samples[] = {
+		sample_session,
+		"",
+		"\n",
+		"## You\nhello",
+		"no headings at all\njust text\n",
+		"## Nonsense\n### Also nonsense\n\ttabbed\n   \n## You\nreal\n",
+		"## Session\n- unknown-key: keep me\n- model: gpt-5\n",
+	};
+
+	for (const auto& text : samples)
+	{
+		const auto lines = agent_session::to_lines(text);
+		should::is_equal(text, agent_session::to_text(lines), "round trip");
+
+		// Parsing must never rewrite anything
+		const auto before = agent_session::to_text(lines);
+		const auto entries = agent_session::parse(lines);
+		should::is_equal(before, agent_session::to_text(lines), "parse does not mutate");
+		should::is_equal_true(entries.size() <= lines.size(), "entries bounded by lines");
+	}
+}
+
+static void should_session_parse_entries()
+{
+	const auto lines = agent_session::to_lines(sample_session);
+	const auto entries = agent_session::parse(lines);
+
+	should::is_equal(size_t{5}, entries.size(), "entry count");
+	should::is_equal_true(entries[0].kind == agent_entry_kind::session, "session first");
+	should::is_equal_true(entries[1].kind == agent_entry_kind::user, "then user");
+	should::is_equal_true(entries[2].kind == agent_entry_kind::agent, "then agent");
+	should::is_equal_true(entries[3].kind == agent_entry_kind::tool_call, "then tool");
+	should::is_equal_true(entries[4].kind == agent_entry_kind::question, "then question");
+
+	should::is_equal("git status", entries[3].title, "tool title");
+	should::is_equal("approved", entries[3].status, "tool status");
+	should::is_equal("which file should I change?", entries[4].title, "question title");
+
+	should::is_equal(size_t{2}, entries[4].options.size(), "option count");
+	should::is_equal("src/view_doc.h", entries[4].options[0].label, "first option");
+	should::is_equal_true(entries[4].options[0].chosen, "first chosen");
+	should::is_equal(false, entries[4].options[1].chosen, "second not chosen");
+	should::is_equal(0, entries[4].chosen_option(), "chosen index");
+
+	// Ranges are contiguous and cover the file after the leading header
+	for (size_t i = 1; i < entries.size(); ++i)
+		should::is_equal(entries[i - 1].last_line, entries[i].first_line, "entries are contiguous");
+
+	should::is_equal(static_cast<int>(lines.size()), entries.back().last_line, "last entry runs to the end");
+}
+
+// An agent writes markdown, so its own headings must not be mistaken for entry boundaries
+static void should_session_keep_agent_markdown_inside_its_entry()
+{
+	const auto lines = agent_session::to_lines(
+		"## Agent\n"
+		"\n"
+		"## Summary\n"
+		"### Details\n"
+		"#### Deeper\n"
+		"Some prose.\n");
+
+	const auto entries = agent_session::parse(lines);
+
+	should::is_equal(size_t{1}, entries.size(), "one entry");
+	should::is_equal_true(entries[0].kind == agent_entry_kind::agent, "agent entry");
+	should::is_equal(static_cast<int>(lines.size()), entries[0].last_line, "covers every line");
+}
+
+static void should_session_escape_heading_like_body()
+{
+	should::is_equal("\\## You", agent_session::escape_body_line("## You"), "role heading escaped");
+	should::is_equal("\\### Tool: x", agent_session::escape_body_line("### Tool: x"), "tool heading escaped");
+	should::is_equal("\\### Plan", agent_session::escape_body_line("### Plan"), "plan heading escaped");
+	should::is_equal("## Summary", agent_session::escape_body_line("## Summary"), "other heading untouched");
+	should::is_equal("plain", agent_session::escape_body_line("plain"), "plain text untouched");
+
+	std::vector<std::string> lines;
+	agent_session::append_entry(lines, agent_entry_kind::agent, {}, "## You\nnot a new entry");
+
+	const auto entries = agent_session::parse(lines);
+	should::is_equal(size_t{1}, entries.size(), "escaped body stays in one entry");
+}
+
+static void should_session_read_options()
+{
+	const auto lines = agent_session::to_lines(sample_session);
+	const auto options = agent_session::read_options(lines, agent_session::parse(lines));
+
+	should::is_equal("claude-sonnet-4.5", options.model, "model");
+	should::is_equal(false, options.yolo, "yolo off");
+
+	const auto on = agent_session::to_lines("## Session\n- yolo: on\n");
+	should::is_equal_true(agent_session::read_options(on, agent_session::parse(on)).yolo, "yolo on");
+
+	// Missing options fall back rather than failing
+	const auto empty = agent_session::to_lines("## You\nhi\n");
+	const auto fallback = agent_session::read_options(empty, agent_session::parse(empty));
+	should::is_equal("", fallback.model, "no model");
+	should::is_equal(false, fallback.yolo, "no yolo");
+}
+
+static void should_session_set_options_preserving_unknown_keys()
+{
+	auto lines = agent_session::to_lines(sample_session);
+	agent_session::set_option(lines, "yolo", "on");
+
+	auto options = agent_session::read_options(lines, agent_session::parse(lines));
+	should::is_equal_true(options.yolo, "yolo updated");
+	should::is_equal("claude-sonnet-4.5", options.model, "model untouched");
+	should::is_equal_true(agent_session::to_text(lines).find("Fix the wrap cache") != std::string::npos,
+	                      "conversation untouched");
+
+	// A key we do not know about survives a write
+	auto custom = agent_session::to_lines("## Session\n- unknown-key: keep me\n- model: gpt-5\n");
+	agent_session::set_option(custom, "model", "gpt-6");
+	const auto text = agent_session::to_text(custom);
+
+	should::is_equal_true(text.find("- unknown-key: keep me") != std::string::npos, "unknown key kept");
+	should::is_equal_true(text.find("- model: gpt-6") != std::string::npos, "known key updated");
+	should::is_equal_true(text.find("gpt-5") == std::string::npos, "old value gone");
+
+	// A missing key is added to the existing block
+	auto without = agent_session::to_lines("## Session\n- model: gpt-5\n\n## You\nhi\n");
+	agent_session::set_option(without, "yolo", "on");
+	should::is_equal_true(agent_session::read_options(without, agent_session::parse(without)).yolo, "key added");
+	should::is_equal_true(agent_session::to_text(without).find("## You\nhi") != std::string::npos,
+	                      "added inside the session block");
+
+	// An empty file grows a header
+	std::vector<std::string> fresh;
+	agent_session::set_option(fresh, "model", "gpt-5");
+	should::is_equal_true(agent_session::to_text(fresh).starts_with(agent_session::file_header), "header written");
+	should::is_equal("gpt-5", agent_session::read_options(fresh, agent_session::parse(fresh)).model, "model set");
+}
+
+static void should_session_choose_option()
+{
+	auto lines = agent_session::to_lines(sample_session);
+	auto entries = agent_session::parse(lines);
+
+	agent_session::choose_option(lines, entries.back(), 1);
+	entries = agent_session::parse(lines);
+
+	should::is_equal(1, entries.back().chosen_option(), "second option chosen");
+	should::is_equal(false, entries.back().options[0].chosen, "first cleared");
+	should::is_equal("src/document.cpp", entries.back().options[1].label, "label preserved");
+
+	// Out of range does nothing
+	const auto before = agent_session::to_text(lines);
+	agent_session::choose_option(lines, entries.back(), 99);
+	should::is_equal(before, agent_session::to_text(lines), "out of range ignored");
+}
+
+static void should_session_append_entries_and_chunks()
+{
+	std::vector<std::string> lines;
+	agent_session::ensure_header(lines);
+	agent_session::append_entry(lines, agent_entry_kind::user, {}, "hello there");
+	agent_session::append_entry(lines, agent_entry_kind::agent, {}, {});
+
+	agent_session::append_chunk(lines, "Hel");
+	agent_session::append_chunk(lines, "lo");
+	agent_session::append_chunk(lines, " world");
+
+	const auto entries = agent_session::parse(lines);
+	should::is_equal(size_t{3}, entries.size(), "session, user, agent");
+	should::is_equal_true(entries[2].kind == agent_entry_kind::agent, "last is the agent");
+	should::is_equal_true(agent_session::to_text(lines).find("Hello world") != std::string::npos,
+	                      "chunks joined into one line");
+
+	// A tool call carries its title into the heading and back out again
+	agent_session::append_entry(lines, agent_entry_kind::tool_call, "git status (approved)", {});
+	const auto with_tool = agent_session::parse(lines);
+	should::is_equal_true(with_tool.back().kind == agent_entry_kind::tool_call, "tool entry");
+	should::is_equal("git status", with_tool.back().title, "tool title");
+	should::is_equal("approved", with_tool.back().status, "tool status");
+
+	// Exactly one blank line separates entries however often we append
+	should::is_equal_true(agent_session::to_text(lines).find("\n\n\n") == std::string::npos, "no double blanks");
+}
+
+static void should_session_survive_hand_mangled_files()
+{
+	constexpr std::string_view mangled =
+		"## Session\n"
+		"- yolo\n"                       // no colon
+		"-[x] not an option\n"           // missing space
+		"## You\n"
+		"### Tool:\n"                    // no title
+		"### Question:\n"
+		"- [y] bad mark\n"
+		"- [ ]\n"                        // empty label
+		"##NoSpace\n"
+		"   ## Indented\n";
+
+	const auto lines = agent_session::to_lines(mangled);
+	const auto entries = agent_session::parse(lines);
+
+	should::is_equal(mangled, agent_session::to_text(lines), "still round trips");
+	should::is_equal_true(entries.size() >= 2, "still finds the real headings");
+	should::is_equal_true(entries[0].kind == agent_entry_kind::session, "session found");
+
+	const auto options = agent_session::read_options(lines, entries);
+	should::is_equal(false, options.yolo, "malformed bullet ignored");
+	should::is_equal("", options.model, "no model");
+}
+
+static void should_parse_slash_commands()
+{
+	using agent_session::parse_command;
+
+	should::is_equal_true(parse_command("hello there").command == agent_command::prompt, "plain text");
+	should::is_equal("hello there", parse_command("hello there").text, "prompt text");
+	should::is_equal_true(parse_command("what about a/b?").command == agent_command::prompt,
+	                      "slash inside text is not a command");
+
+	should::is_equal_true(parse_command("/help").command == agent_command::help, "help");
+	should::is_equal_true(parse_command("/h").command == agent_command::help, "help alias");
+	should::is_equal_true(parse_command("/clear").command == agent_command::clear, "clear");
+	should::is_equal_true(parse_command("/c").command == agent_command::clear, "clear alias");
+	should::is_equal_true(parse_command("/stop").command == agent_command::stop, "stop");
+	should::is_equal_true(parse_command("/s").command == agent_command::stop, "stop alias");
+	should::is_equal_true(parse_command("/models").command == agent_command::models, "models");
+	should::is_equal_true(parse_command("/m").command == agent_command::models, "models alias");
+	should::is_equal_true(parse_command("/yolo").command == agent_command::yolo, "yolo");
+
+	should::is_equal_true(parse_command("  /help  ").command == agent_command::help, "surrounding space");
+	should::is_equal("gpt-5", parse_command("/models gpt-5").text, "argument captured");
+
+	// Unknown unless the agent advertised it
+	should::is_equal_true(parse_command("/context").command == agent_command::unknown, "unknown by default");
+	should::is_equal("context", parse_command("/context").name, "unknown keeps the name");
+
+	const advertised_command advertised[] = {{"context", "Show token usage"}};
+	const auto forwarded = parse_command("/context detail", advertised);
+	should::is_equal_true(forwarded.command == agent_command::forward, "forwarded when advertised");
+	should::is_equal("/context detail", forwarded.text, "forwarded verbatim");
+}
+
+// The table is the single source of truth, so help can never drift from the parser
+static void should_generate_help_from_the_command_table()
+{
+	const auto text = agent_session::help_text();
+
+	for (const auto& def : agent_session::command_table())
+	{
+		should::is_equal_true(text.find(std::format("/{}", def.name)) != std::string::npos,
+		                      std::format("help lists /{}", def.name));
+		should::is_equal_true(text.find(def.description) != std::string::npos,
+		                      std::format("help describes /{}", def.name));
+
+		if (!def.alias.empty())
+			should::is_equal_true(text.find(std::format("/{}", def.alias)) != std::string::npos,
+			                      std::format("help lists the /{} alias", def.alias));
+
+		// Every listed command must actually parse
+		should::is_equal_true(agent_session::parse_command(std::format("/{}", def.name)).command == def.command,
+		                      "help entry parses");
+	}
+
+	const advertised_command advertised[] = {{"context", "Show token usage"}};
+	const auto with_agent = agent_session::help_text(advertised);
+	should::is_equal_true(with_agent.find("/context") != std::string::npos, "lists agent commands");
+	should::is_equal_true(with_agent.find("Show token usage") != std::string::npos, "describes them");
+}
+
+static void should_read_advertised_commands()
+{
+	const auto parsed = json::parse(
+		R"({"availableCommands":[{"name":"context","description":"Show usage"},{"name":"","description":"skip"},{"name":"plan"}]})");
+
+	const auto commands = agent_session::read_advertised_commands(parsed.root);
+
+	should::is_equal(size_t{2}, commands.size(), "nameless entry skipped");
+	should::is_equal("context", commands[0].name, "first name");
+	should::is_equal("Show usage", commands[0].description, "first description");
+	should::is_equal("plan", commands[1].name, "second name");
+	should::is_equal("", commands[1].description, "missing description is empty");
+}
+
+static json::value make_update(const std::string_view text)
+{
+	return json::parse(text).root;
+}
+
+// A token stream must extend one line rather than growing the file
+static void should_stream_chunks_into_one_line()
+{
+	std::vector<std::string> lines;
+	agent_stream_state state;
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hel"}})"));
+
+	const auto after_first = lines.size();
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo "}})"));
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"world"}})"));
+
+	should::is_equal(after_first, lines.size(), "later chunks add no lines");
+
+	const auto entries = agent_session::parse(lines);
+	should::is_equal(size_t{1}, entries.size(), "one entry");
+	should::is_equal_true(entries[0].kind == agent_entry_kind::agent, "agent entry");
+	should::is_equal_true(agent_session::to_text(lines).find("Hello world") != std::string::npos, "joined");
+
+	// A thought opens its own entry, and a following message opens a fresh one
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"pondering"}})"));
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}})"));
+
+	const auto kinds = agent_session::parse(lines);
+	should::is_equal(size_t{3}, kinds.size(), "three entries");
+	should::is_equal_true(kinds[1].kind == agent_entry_kind::thought, "thought entry");
+	should::is_equal_true(kinds[2].kind == agent_entry_kind::agent, "new agent entry");
+}
+
+static void should_track_tool_call_lifecycle()
+{
+	std::vector<std::string> lines;
+	agent_stream_state state;
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"tool_call","toolCallId":"t1","title":"git status","kind":"execute","status":"pending"})"));
+
+	auto entries = agent_session::parse(lines);
+	should::is_equal_true(entries.back().kind == agent_entry_kind::tool_call, "tool entry");
+	should::is_equal("git status", entries.back().title, "title");
+	should::is_equal("pending", entries.back().status, "pending");
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"})"));
+
+	entries = agent_session::parse(lines);
+	should::is_equal(size_t{1}, entries.size(), "updated in place, not appended");
+	should::is_equal("git status", entries.back().title, "title kept");
+	should::is_equal("completed", entries.back().status, "status updated");
+
+	// An update for a call we never saw changes nothing
+	const auto before = agent_session::to_text(lines);
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"tool_call_update","toolCallId":"nope","status":"failed"})"));
+	should::is_equal(before, agent_session::to_text(lines), "unknown tool call ignored");
+
+	// A title-less call falls back to its kind
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"tool_call","toolCallId":"t2","kind":"read","status":"pending"})"));
+	should::is_equal("read", agent_session::parse(lines).back().title, "kind used as the title");
+}
+
+static void should_write_plans_as_options()
+{
+	std::vector<std::string> lines;
+	agent_stream_state state;
+
+	agent_session::apply_update(lines, state, make_update(
+		                            R"({"sessionUpdate":"plan","entries":[{"content":"Read the file","status":"completed"},{"content":"Fix the bug","status":"pending"}]})"));
+
+	const auto entries = agent_session::parse(lines);
+	should::is_equal_true(entries.back().kind == agent_entry_kind::plan, "plan entry");
+	should::is_equal(size_t{2}, entries.back().options.size(), "two steps");
+	should::is_equal_true(entries.back().options[0].chosen, "completed step ticked");
+	should::is_equal(false, entries.back().options[1].chosen, "pending step not ticked");
+	should::is_equal("Fix the bug", entries.back().options[1].label, "step text");
+}
+
+static void should_ignore_unknown_updates()
+{
+	std::vector<std::string> lines;
+	agent_stream_state state;
+
+	agent_session::apply_update(lines, state, make_update(R"({"sessionUpdate":"something_new","data":1})"));
+	agent_session::apply_update(lines, state, make_update(R"({})"));
+
+	should::is_equal(size_t{0}, lines.size(), "nothing written");
+}
+
+// The document pane must keep at least a usable width however the splitters are dragged
+static void should_clamp_agent_splitter_to_the_document_pane()
+{
+	const auto state = create_test_app();
+	const pf::irect bounds{0, 0, 1000, 800};
+
+	state->_panel_splitter._ratio = 0.2;
+	auto agent_area = state->agent_splitter_bounds(bounds);
+	should::is_equal_true(agent_area.left >= state->_panel_splitter.split_pos(bounds), "starts after the list");
+
+	// Dragging the list splitter far right collapses the agent area rather than pushing it off screen
+	state->_panel_splitter._ratio = splitter::max_ratio;
+	agent_area = state->agent_splitter_bounds(bounds);
+	should::is_equal_true(agent_area.left > state->_panel_splitter.split_pos(bounds), "never crosses");
+	should::is_equal_true(agent_area.right >= agent_area.left, "never inverts");
+	should::is_equal_true(agent_area.right <= bounds.right, "stays inside the window");
+
+	// Dragging the agent splitter to either extreme still leaves both panes on screen
+	for (const auto ratio : {splitter::min_ratio, 0.5, splitter::max_ratio})
+	{
+		state->_agent_splitter._ratio = ratio;
+		const auto split = state->_agent_splitter.split_pos(state->agent_splitter_bounds(bounds));
+		should::is_equal_true(split > state->_panel_splitter.split_pos(bounds), "document pane survives");
+		should::is_equal_true(split <= bounds.right, "agent pane stays on screen");
+	}
+}
+
+// A thumb held at its minimum length still has to fit inside the track at either end
+static void should_keep_the_scrollbar_thumb_inside_the_track()
+{
+	custom_scrollbar bar{custom_scrollbar::orientation::vertical};
+
+	constexpr auto track_top = 20;
+	constexpr auto track_extent = 400;
+	constexpr auto page = 400;
+	constexpr auto content = 40000; // long enough that the thumb hits its minimum length
+
+	bar.update(content, page, 0);
+	auto thumb = bar.thumb(track_top, track_extent);
+	should::is_equal(track_top, thumb.start, "starts at the top of the track");
+	should::is_equal(bar.thumb_thickness(), thumb.length, "clamped to the minimum length");
+
+	bar.update(content, page, content - page);
+	thumb = bar.thumb(track_top, track_extent);
+	should::is_equal(track_top + track_extent, thumb.start + thumb.length, "ends flush with the track");
+	should::is_equal_true(thumb.start >= track_top, "never above the track");
+
+	// Half way is still proportional
+	bar.update(content, page, (content - page) / 2);
+	thumb = bar.thumb(track_top, track_extent);
+	should::is_equal_true(thumb.start > track_top, "moved down");
+	should::is_equal_true(thumb.start + thumb.length < track_top + track_extent, "not yet at the end");
+
+	// Nothing to scroll means nothing to draw
+	bar.update(page, page, 0);
+	should::is_equal(0, bar.thumb(track_top, track_extent).length, "no thumb when it all fits");
+}
+
+// The transcript pane must offer a scrollbar once the conversation outgrows it
+static void should_scroll_the_agent_transcript()
+{
+	const auto state = create_test_app();
+	pf::window_frame_ptr window = std::make_shared<stub_window_frame>();
+	stub_measure_context measure;
+
+	std::string long_transcript;
+	for (auto i = 0; i < 200; ++i)
+		long_transcript += std::format("transcript line {}\n", i);
+
+	const auto doc = std::make_shared<document>(null_ev, long_transcript);
+	const auto view = std::make_shared<agent_view>(*state);
+
+	view->set_document(doc);
+
+	// Sizing alone must arm the scrollbar: the base only raises the document pane's bit
+	view->handle_size(window, pf::isize{400, 320}, measure);
+
+	const auto& bar = view->vert_scrollbar();
+	should::is_equal_true(bar.can_scroll(), "the transcript scrolls");
+
+	// The input box sits below the transcript, so the track must stop short of it
+	should::is_equal_true(bar._page_size <= 320, "track fits the pane");
+
+	view->scroll_to_end();
+	should::is_equal_true(view->at_bottom(), "reaches the end");
+	should::is_equal_true(view->vert_scrollbar().can_scroll(), "still scrolls at the end");
+}
+
+// The prompt is a document view, so it gets selection, clipboard and undo for free
+static void should_edit_the_agent_prompt_like_a_document()
+{
+	const auto state = create_test_app();
+	pf::window_frame_ptr window = std::make_shared<stub_window_frame>();
+	stub_measure_context measure;
+
+	const auto& view = state->_agent_input_view;
+	view->handle_size(window, pf::isize{400, 64}, measure);
+	view->set_text("hello world");
+
+	should::is_equal("hello world", view->text(), "text set");
+
+	// Reached the way the command table reaches them, through the focused text view
+	const text_view_ptr focused = view;
+
+	focused->select_all_text();
+	should::is_equal_true(focused->can_copy_text(), "a selection can be copied");
+	should::is_equal_true(focused->can_cut_text(), "a selection can be cut");
+	should::is_equal_true(focused->cut_text_to_clipboard(), "cut");
+	should::is_equal("", view->text(), "cut emptied the prompt");
+
+	should::is_equal_true(focused->can_paste_text(), "the clipboard has the prompt");
+	should::is_equal_true(focused->paste_text_from_clipboard(), "paste");
+	should::is_equal("hello world", view->text(), "pasted back");
+
+	// The prompt has its own undo, so Ctrl+Z here cannot reach the document pane
+	const auto editor_text = state->doc()->str();
+	state->_agent_input_doc->edit_undo();
+	should::is_equal(editor_text, state->doc()->str(), "the editor document is untouched");
+}
+
+// The prompt grows with what is typed, then stops and scrolls instead
+static void should_grow_agent_input_to_five_rows()
+{
+	const auto state = create_test_app();
+	pf::window_frame_ptr window = std::make_shared<stub_window_frame>();
+	stub_measure_context measure;
+
+	const auto& view = state->_agent_input_view;
+	view->handle_size(window, pf::isize{400, 64}, measure);
+
+	should::is_equal(1, view->rows(), "empty is one row");
+
+	view->set_text("one line");
+	view->layout();
+	should::is_equal(1, view->rows(), "single line");
+
+	view->set_text("one\ntwo\nthree");
+	view->layout();
+	should::is_equal(3, view->rows(), "three lines");
+
+	view->set_text("1\n2\n3\n4\n5");
+	view->layout();
+	should::is_equal(agent_input_view::max_rows, view->rows(), "five lines");
+
+	// Beyond the cap the box stops growing and the text scrolls instead
+	view->set_text("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+	view->layout();
+	should::is_equal(agent_input_view::max_rows, view->rows(), "capped at five");
+
+	view->handle_size(window, pf::isize{400, view->desired_height()}, measure);
+	should::is_equal_true(view->vert_scrollbar().can_scroll(), "scrolls past the cap");
+
+	// A long single line wraps rather than running off the edge
+	view->set_text(std::string(400, 'x'));
+	view->layout();
+	should::is_equal_true(view->rows() > 1, "a long line wraps onto more rows");
+}
+
+// Editing the transcript must not disturb the document pane's caches
+static void should_keep_the_session_document_separate_from_the_editor()
+{
+	const auto state = create_test_app();
+	const auto root = create_temp_test_root();
+	state->set_root(std::make_shared<index_item>(root, root.name(), true));
+	state->ensure_agent_host();
+	state->_agent_host->locate = [] { return pf::file_path{}; };
+
+	const auto editor_doc = state->doc();
+
+	const auto session = state->session_item();
+	should::is_equal_true(session != nullptr, "session item exists");
+	should::is_equal_true(session->doc != editor_doc, "a document of its own");
+	should::is_equal(std::string(agent_session::file_name), session->name, "named session.md");
+
+	const auto editor_lines = static_cast<int>(editor_doc->size());
+	state->on_agent_input("hello agent");
+
+	should::is_equal(editor_lines, static_cast<int>(editor_doc->size()), "editor untouched");
+	should::is_equal_true(static_cast<int>(session->doc->size()) > editor_lines, "transcript grew");
+	should::is_equal_true(state->doc() == editor_doc, "active document unchanged");
+
+	pf::platform_recycle_file(root);
+}
+
+static void should_handle_agent_slash_commands_in_the_panel()
+{
+	const auto state = create_test_app();
+	const auto root = create_temp_test_root();
+	state->set_root(std::make_shared<index_item>(root, root.name(), true));
+	state->ensure_agent_host();
+
+	// Tests must never launch the real agent
+	state->_agent_host->locate = [] { return pf::file_path{}; };
+
+	state->on_agent_input("/help");
+	auto text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("/clear") != std::string::npos, "help lists the commands");
+
+	state->on_agent_input("/nonsense");
+	text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("Unknown command /nonsense") != std::string::npos, "unknown reported");
+
+	// A plain message is recorded as the user's turn, then reports that no agent was found
+	state->on_agent_input("do the thing");
+	text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("do the thing") != std::string::npos, "user turn recorded");
+	should::is_equal_true(text.find("Could not find") != std::string::npos, "missing agent reported");
+
+	// The transcript is a real file, written where the folder is open
+	const auto path = root.combine(agent_session::file_name);
+	should::is_equal_true(path.exists(), "written to disk");
+
+	// Clearing empties it, on disk as well as on screen
+	state->on_agent_input("/clear");
+	text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("do the thing") == std::string::npos, "history cleared");
+	should::is_equal_true(text.starts_with(agent_session::file_header), "header restored");
+
+	// Undo brings the conversation back, because clearing is an ordinary edit
+	state->session_item()->doc->undo();
+	should::is_equal_true(state->session_item()->doc->str().find("do the thing") != std::string::npos,
+	                      "clear can be undone");
+
+	pf::platform_recycle_file(root);
+}
+
+// A conversation survives closing the folder, but auto-approval is never resumed silently
+static void should_reload_the_transcript_and_reset_yolo()
+{
+	const auto root = create_temp_test_root();
+	const auto path = root.combine(agent_session::file_name);
+
+	write_test_text_file(path,
+	                     "<!-- rethinkify agent session v1 -->\n\n"
+	                     "## Session\n- model: gpt-5\n- yolo: on\n\n"
+	                     "## You\n\nearlier question\n");
+
+	const auto state = create_test_app();
+	state->set_root(std::make_shared<index_item>(root, root.name(), true));
+
+	const auto text = state->session_item()->doc->str();
+	should::is_equal_true(text.find("earlier question") != std::string::npos, "history restored");
+
+	const auto lines = agent_session::to_lines(text);
+	const auto options = agent_session::read_options(lines, agent_session::parse(lines));
+	should::is_equal("gpt-5", options.model, "model restored");
+	should::is_equal(false, options.yolo, "auto approval not resumed");
+	should::is_equal_true(text.find("YOLO") != std::string::npos, "and says so");
+
+	pf::platform_recycle_file(root);
+}
+
+// collecting_sink — Records what the host writes, standing in for the pane
+struct collecting_sink final : agent_host::events
+{
+	std::vector<std::string> lines;
+	std::string status;
+	std::map<std::string, std::string> files;
+	bool refuse_files = false;
+
+	void transcript_changed(const int first, const std::span<const std::string> replacement) override
+	{
+		lines.resize(static_cast<size_t>(std::clamp(first, 0, static_cast<int>(lines.size()))));
+
+		for (const auto& line : replacement)
+			lines.push_back(line);
+	}
+
+	void agent_status_changed(const std::string_view text) override { status = text; }
+
+	bool read_file(const pf::file_path& path, std::string& content, std::string& error) override
+	{
+		if (refuse_files)
+		{
+			error = "outside the open folder";
+			return false;
+		}
+
+		const auto found = files.find(std::string(path.view()));
+
+		if (found == files.end())
+		{
+			error = "no such file";
+			return false;
+		}
+
+		content = found->second;
+		return true;
+	}
+
+	bool write_file(const pf::file_path& path, const std::string_view content, std::string& error) override
+	{
+		if (refuse_files)
+		{
+			error = "outside the open folder";
+			return false;
+		}
+
+		files[std::string(path.view())] = content;
+		return true;
+	}
+
+	void transcript_settled() override { ++settled_count; }
+
+	int settled_count = 0;
+
+	[[nodiscard]] std::string text() const { return agent_session::to_text(lines); }
+};
+
+static std::unique_ptr<agent_host> connected_host(collecting_sink& sink, recording_transport*& wire_out)
+{
+	auto host = std::make_unique<agent_host>(sink);
+	auto wire = std::make_unique<recording_transport>();
+	wire_out = wire.get();
+
+	host->connect(std::move(wire), pf::file_path{"C:\\work"});
+
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                                wire_out->last_id()));
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"s1"}}}})",
+	                                wire_out->last_id()));
+	return host;
+}
+
+static void should_run_an_agent_turn()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	should::is_equal_true(host->connected(), "connected");
+	should::is_equal("Ready", sink.status, "ready status");
+
+	host->submit("fix the bug");
+	should::is_equal_true(sink.text().find("fix the bug") != std::string::npos, "user turn written");
+	should::is_equal_true(host->busy(), "turn in flight");
+	should::is_equal_true(sink.status.find("/s to stop") != std::string::npos, "status offers a way out");
+
+	const auto prompt_id = wire->last_id();
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Look"}}}})");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ing"}}}})");
+
+	should::is_equal_true(sink.text().find("Looking") != std::string::npos, "chunks joined");
+
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})", prompt_id));
+	should::is_equal(false, host->busy(), "turn finished");
+	should::is_equal("Ready", sink.status, "back to ready");
+
+	// The transcript is offered for saving once the turn is over, not once per token
+	should::is_equal_true(sink.settled_count > 0, "transcript settled");
+}
+
+// A streamed token must rewrite one line, not the whole transcript
+static void should_patch_only_the_tail_while_streaming()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("go");
+
+	auto smallest_first = std::numeric_limits<int>::max();
+
+	struct watching_sink final : agent_host::events
+	{
+		collecting_sink& inner;
+		int& smallest;
+
+		watching_sink(collecting_sink& s, int& f) : inner(s), smallest(f)
+		{
+		}
+
+		void transcript_changed(const int first, const std::span<const std::string> replacement) override
+		{
+			smallest = std::min(smallest, static_cast<int>(replacement.size()));
+			inner.transcript_changed(first, replacement);
+		}
+
+		void agent_status_changed(const std::string_view text) override { inner.agent_status_changed(text); }
+
+		bool read_file(const pf::file_path& path, std::string& content, std::string& error) override
+		{
+			return inner.read_file(path, content, error);
+		}
+
+		bool write_file(const pf::file_path& path, const std::string_view content, std::string& error) override
+		{
+			return inner.write_file(path, content, error);
+		}
+
+		void transcript_settled() override { inner.transcript_settled(); }
+	};
+
+	watching_sink watcher(sink, smallest_first);
+	auto streaming = std::make_unique<agent_host>(watcher);
+	streaming->adopt(sink.lines);
+
+	auto wire2 = std::make_unique<recording_transport>();
+	streaming->connect(std::move(wire2), pf::file_path{"C:\\work"});
+
+	for (const auto* chunk : {"a", "b", "c"})
+	{
+		streaming->on_agent_line(std::format(
+			R"({{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{}"}}}}}}}})",
+			chunk));
+	}
+
+	should::is_equal(1, smallest_first, "a later chunk rewrites a single line");
+}
+
+static void should_ask_before_running_a_tool()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("check the repo");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":77,"method":"session/request_permission","params":{"toolCall":{"title":"git status"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
+
+	const auto text = sink.text();
+	should::is_equal_true(text.find("git status") != std::string::npos, "names the tool");
+	should::is_equal_true(text.find("1. Allow") != std::string::npos, "numbers the options");
+	should::is_equal_true(text.find("2. Reject") != std::string::npos, "lists every option");
+	should::is_equal_true(sink.status.find("Waiting") != std::string::npos, "status asks for an answer");
+
+	// Nothing was sent back until the user chose
+	should::is_equal_true(wire->last()["result"].is_null(), "no answer yet");
+
+	// A prompt that merely opens with a digit is a prompt, not an answer
+	host->submit("2 files changed since then");
+	should::is_equal_true(host->awaiting_answer(), "still waiting for an answer");
+	should::is_equal_true(sink.text().find("2 files changed since then") != std::string::npos,
+	                      "the text was recorded as a prompt");
+
+	host->submit("2");
+
+	const auto reply = wire->last();
+	should::is_equal(77, static_cast<int>(reply["id"].integer()), "answers the right request");
+	should::is_equal("selected", reply["result"]["outcome"]["outcome"].text(), "selected outcome");
+	should::is_equal("no", reply["result"]["outcome"]["optionId"].text(), "the option the user picked");
+
+	// The choice is recorded in the file
+	const auto entries = agent_session::parse(sink.lines);
+	const auto question = std::ranges::find_if(entries, [](const agent_entry& e)
+	{
+		return e.kind == agent_entry_kind::question;
+	});
+	should::is_equal_true(question != entries.end(), "question entry written");
+	should::is_equal(1, question->chosen_option(), "second option ticked");
+}
+
+// Clicking an option answers it, which is the same path as typing its number
+static void should_answer_a_question_by_selection()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	should::is_equal(false, host->awaiting_answer(), "nothing pending");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":21,"method":"session/request_permission","params":{"toolCall":{"title":"write file"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
+
+	should::is_equal_true(host->awaiting_answer(), "waiting for an answer");
+
+	host->answer(0);
+
+	const auto reply = wire->last();
+	should::is_equal(21, static_cast<int>(reply["id"].integer()), "answers the request");
+	should::is_equal("yes", reply["result"]["outcome"]["optionId"].text(), "the option selected");
+	should::is_equal(false, host->awaiting_answer(), "no longer waiting");
+
+	// A selection out of range, or a second answer, changes nothing
+	const auto count = wire->sent.size();
+	host->answer(0);
+	host->answer(99);
+	should::is_equal(count, wire->sent.size(), "ignored once answered");
+}
+
+static void should_auto_approve_only_in_yolo_mode()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("/yolo");
+	should::is_equal_true(host->yolo(), "yolo on");
+	should::is_equal_true(sink.text().find("yolo: on") != std::string::npos, "recorded in the session block");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":88,"method":"session/request_permission","params":{"toolCall":{"title":"rm -rf"},"options":[{"optionId":"deny","name":"Reject","kind":"reject_once"},{"optionId":"ok","name":"Allow","kind":"allow_once"}]}})");
+
+	const auto reply = wire->last();
+	should::is_equal(88, static_cast<int>(reply["id"].integer()), "answered immediately");
+	should::is_equal("ok", reply["result"]["outcome"]["optionId"].text(), "chose the allow option");
+	should::is_equal_true(sink.text().find("Allowed automatically: rm -rf") != std::string::npos,
+	                      "still recorded in the transcript");
+
+	// Turning it back off restores the prompt
+	host->submit("/yolo");
+	should::is_equal(false, host->yolo(), "yolo off");
+	should::is_equal_true(sink.text().find("yolo: off") != std::string::npos, "recorded as off");
+}
+
+static void should_stop_a_running_turn()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("/s");
+	should::is_equal_true(sink.text().find("not working on anything") != std::string::npos, "nothing to stop");
+
+	host->submit("long task");
+	const auto prompt_id = wire->last_id();
+	host->submit("/s");
+
+	should::is_equal("session/cancel", wire->last()["method"].text(), "cancel sent");
+
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"cancelled"}}}})", prompt_id));
+	should::is_equal(false, host->busy(), "turn ended");
+	should::is_equal_true(sink.text().find("cancelled") != std::string::npos, "recorded in the transcript");
+}
+
+// The protocol requires every outstanding permission request to be answered before a
+// cancelled turn can end, and a tool that is being abandoned to stop reading as running
+static void should_settle_everything_the_turn_left_open()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("long task");
+	const auto prompt_id = wire->last_id();
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"grep","status":"in_progress"}}})");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":91,"method":"session/request_permission","params":{"toolCall":{"title":"rm -rf"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"}]}})");
+
+	// A second message typed while the agent worked, which stopping must not go on to send
+	host->submit("and then this");
+	should::is_equal(size_t{1}, host->queued_prompt_count(), "queued behind the turn");
+
+	host->submit("/s");
+
+	const auto answered = std::ranges::find_if(wire->sent, [](const std::string& line)
+	{
+		return json::parse(line).root["id"].integer(0) == 91;
+	});
+
+	should::is_equal_true(answered != wire->sent.end(), "the permission request was answered");
+	should::is_equal("cancelled", json::parse(*answered).root["result"]["outcome"]["outcome"].text(),
+	                 "answered with the cancelled outcome, not an error");
+	should::is_equal(false, host->awaiting_answer(), "nothing left to ask");
+	should::is_equal(size_t{0}, host->queued_prompt_count(), "the queue was discarded");
+	should::is_equal_true(sink.text().find("### Tool: grep (cancelled)") != std::string::npos,
+	                      "the abandoned tool no longer reads as running");
+
+	// Ending the turn must not resurrect the discarded message
+	const auto sent_before = wire->sent.size();
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"cancelled"}}}})", prompt_id));
+	should::is_equal(sent_before, wire->sent.size(), "no queued message followed the cancel");
+}
+
+// Re-adopting the transcript mid-turn must not lose where the running tool calls are
+static void should_keep_streaming_across_a_queued_message()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("go");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"t9","title":"build","status":"in_progress"}}})");
+
+	// What the app does on every submit: hand back the lines the document now holds
+	host->adopt(sink.lines);
+	host->submit("and this too");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"t9","status":"completed"}}})");
+
+	should::is_equal_true(sink.text().find("### Tool: build (completed)") != std::string::npos,
+	                      "the running tool still knew which line was its own");
+}
+
+// /m with no argument offers the agent's models; the reply picks one
+static void should_offer_a_model_choice()
+{
+	collecting_sink sink;
+	auto host = std::make_unique<agent_host>(sink);
+	auto owned_wire = std::make_unique<recording_transport>();
+	auto* wire = owned_wire.get();
+
+	host->connect(std::move(owned_wire), pf::file_path{"C:\\work"});
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                                wire->last_id()));
+	host->on_agent_line(std::format(
+		R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"s1","models":{{"currentModelId":"fast",)"
+		R"("availableModels":[{{"modelId":"fast","name":"Fast"}},{{"modelId":"deep","name":"Deep"}}]}}}}}})",
+		wire->last_id()));
+
+	host->submit("/m");
+
+	const auto listed = sink.text();
+	should::is_equal_true(listed.find("1. Fast") != std::string::npos, "first model listed");
+	should::is_equal_true(listed.find("2. Deep") != std::string::npos, "second model listed");
+	should::is_equal_true(listed.find("current") != std::string::npos, "current model marked");
+	should::is_equal_true(host->awaiting_answer(), "waiting for a choice");
+
+	host->submit("2");
+
+	should::is_equal("session/set_model", wire->last()["method"].text(), "model change sent");
+	should::is_equal("deep", wire->last()["params"]["modelId"].text(), "chose the second model");
+	should::is_equal(false, host->awaiting_answer(), "question closed");
+
+	const auto answered = sink.text();
+	should::is_equal_true(answered.find("- [x] 2. Deep") != std::string::npos, "choice ticked in the file");
+	should::is_equal_true(answered.find("model: deep") != std::string::npos, "recorded in the session block");
+	should::is_equal("Ready", sink.status, "the status stops asking once it is answered");
+}
+
+static void should_report_a_lost_agent()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("work");
+	host->on_agent_exit(1);
+
+	should::is_equal(false, host->connected(), "no longer connected");
+	should::is_equal(false, host->busy(), "no turn in flight");
+	should::is_equal("Not connected", sink.status, "status reports it");
+	should::is_equal_true(sink.text().find("the agent stopped") != std::string::npos, "written to the transcript");
+}
+
+// A new agent process was not there for the conversation, so it is given it once
+// Only what a new agent can use: the exchange, most recent first to be cut, and never the settings
+static void should_digest_a_transcript()
+{
+	const auto lines = agent_session::to_lines(
+		"<!-- rethinkify agent session v1 -->\n\n## Session\n- model: fast\n- yolo: on\n\n"
+		"## You\n\nfirst question\n\n## Agent\n\nfirst answer\n\n"
+		"## Thinking\n\nprivate musing\n\n## You\n\nsecond question\n\n## Agent\n\nsecond answer\n");
+
+	const auto whole = agent_session::transcript_digest(lines, 4096);
+	should::is_equal_true(whole.find("first question") != std::string::npos, "keeps the exchange");
+	should::is_equal_true(whole.find("second answer") != std::string::npos, "keeps the latest reply");
+	should::is_equal_true(whole.find("private musing") == std::string::npos, "drops thinking");
+	should::is_equal_true(whole.find("yolo") == std::string::npos, "drops the settings block");
+	should::is_equal_true(whole.find("[earlier turns omitted]") == std::string::npos, "nothing omitted");
+
+	// A budget too small to hold it all keeps the end, which is the part still in play
+	const auto trimmed = agent_session::transcript_digest(lines, 64);
+	should::is_equal_true(trimmed.size() <= 64 + 32, "held to the budget");
+	should::is_equal_true(trimmed.find("second answer") != std::string::npos, "keeps the most recent");
+	should::is_equal_true(trimmed.find("first question") == std::string::npos, "drops the oldest");
+	should::is_equal_true(trimmed.find("[earlier turns omitted]") != std::string::npos, "says what it cut");
+
+	should::is_equal_true(agent_session::transcript_digest({}, 4096).empty(), "nothing to say about nothing");
+}
+
+// An agent speaking a protocol this build does not know is refused, not half-driven
+static void should_refuse_a_newer_protocol()
+{
+	{
+		recording_transport wire;
+		acp::client client(wire);
+		complete_handshake(client, wire);
+
+		should::is_equal(acp::protocol_version, client.negotiated_version(), "a version we speak is recorded");
+		should::is_equal_true(client.ready(), "and the session is made");
+	}
+
+	recording_transport wire;
+	acp::client client(wire);
+
+	std::string failure;
+	client.on_error = [&failure](const std::string_view message) { failure = message; };
+
+	client.start("C:\\work");
+	client.on_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":99}}}})", wire.last_id()));
+
+	should::is_equal_true(failure.find("v99") != std::string::npos, "names the version it cannot speak");
+	should::is_equal(false, client.ready(), "not ready");
+	should::is_equal(size_t{1}, wire.sent.size(), "session/new never sent");
+}
+
+static void should_replay_earlier_conversation_to_a_new_session()
+{
+	collecting_sink sink;
+	auto host = std::make_unique<agent_host>(sink);
+	auto owned = std::make_unique<recording_transport>();
+	auto* wire = owned.get();
+
+	host->adopt(agent_session::to_lines(
+		"<!-- rethinkify agent session v1 -->\n\n## Session\n- model: fast\n\n"
+		"## You\n\nrename the widget\n\n## Thinking\n\nnoise nobody needs\n\n"
+		"## Agent\n\nRenamed it in widget.cpp.\n"));
+
+	host->connect(std::move(owned), pf::file_path{"C:\\work"});
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                                wire->last_id()));
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"s1"}}}})",
+	                                wire->last_id()));
+
+	host->submit("now update the tests");
+
+	const auto blocks = wire->last()["params"]["prompt"];
+	should::is_equal(size_t{2}, blocks.size(), "history rides ahead of the prompt");
+
+	const auto history = blocks[0]["text"].text();
+	should::is_equal_true(history.find("rename the widget") != std::string_view::npos, "earlier prompt replayed");
+	should::is_equal_true(history.find("Renamed it in widget.cpp.") != std::string_view::npos, "earlier reply replayed");
+	should::is_equal_true(history.find("noise nobody needs") == std::string_view::npos, "thinking left out");
+	should::is_equal_true(history.find("model: fast") == std::string_view::npos, "settings left out");
+	should::is_equal_true(history.find("history") != std::string_view::npos, "says it is history, not a request");
+	should::is_equal("now update the tests", blocks[1]["text"].text(), "the prompt itself comes last");
+
+	// The live session remembers the rest of the turn, so it is never given it twice
+	const auto prompt_id = wire->last_id();
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})", prompt_id));
+	host->submit("and the docs");
+
+	should::is_equal(size_t{1}, wire->last()["params"]["prompt"].size(), "second prompt carries no history");
+}
+
+// A dead agent loses everything it knew, so its replacement is told the conversation again
+static void should_replay_the_conversation_after_the_agent_dies()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("first question");
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})",
+	                                wire->last_id()));
+	host->on_agent_exit(1);
+
+	// Nothing can be sent without a process, so the next attempt is what proves the intent
+	auto second = std::make_unique<recording_transport>();
+	auto* wire2 = second.get();
+	host->connect(std::move(second), pf::file_path{"C:\\work"});
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":1}}}})",
+	                                wire2->last_id()));
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"sessionId":"s2"}}}})",
+	                                wire2->last_id()));
+
+	host->submit("second question");
+
+	const auto blocks = wire2->last()["params"]["prompt"];
+	should::is_equal(size_t{2}, blocks.size(), "the replacement is told what it missed");
+	should::is_equal_true(blocks[0]["text"].text().find("first question") != std::string_view::npos,
+	                      "the earlier turn is in it");
+}
+
+// Two tool calls at once must not overwrite each other, or the first would never be answered
+static void should_queue_questions_asked_at_once()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":41,"method":"session/request_permission","params":{"toolCall":{"title":"read a.txt"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":42,"method":"session/request_permission","params":{"toolCall":{"title":"delete b.txt"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"},{"optionId":"no","name":"Reject","kind":"reject_once"}]}})");
+
+	should::is_equal(size_t{2}, host->pending_question_count(), "both are waiting");
+
+	// Only one question is in the file, so a number can only mean the one on screen
+	should::is_equal_true(sink.text().find("read a.txt") != std::string::npos, "the first is asked");
+	should::is_equal_true(sink.text().find("delete b.txt") == std::string::npos, "the second waits its turn");
+
+	host->submit("1");
+
+	const auto first_reply = wire->last();
+	should::is_equal(41, static_cast<int>(first_reply["id"].integer()), "the first request is answered");
+	should::is_equal("yes", first_reply["result"]["outcome"]["optionId"].text(), "with the chosen option");
+	should::is_equal_true(sink.text().find("delete b.txt") != std::string::npos, "the second is now asked");
+
+	host->submit("2");
+
+	const auto second_reply = wire->last();
+	should::is_equal(42, static_cast<int>(second_reply["id"].integer()), "the second request is answered");
+	should::is_equal("no", second_reply["result"]["outcome"]["optionId"].text(), "with its own option");
+	should::is_equal(false, host->awaiting_answer(), "nothing left waiting");
+}
+
+// Clearing throws away the questions, so the agent has to be told they will never be answered
+static void should_refuse_pending_questions_when_cleared()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":51,"method":"session/request_permission","params":{"toolCall":{"title":"read a.txt"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"}]}})");
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":52,"method":"session/request_permission","params":{"toolCall":{"title":"read b.txt"},"options":[{"optionId":"yes","name":"Allow","kind":"allow_once"}]}})");
+
+	should::is_equal(size_t{2}, host->pending_question_count(), "both waiting");
+
+	host->submit("/clear");
+
+	should::is_equal(false, host->awaiting_answer(), "nothing left waiting");
+
+	auto refused = 0;
+
+	for (const auto& line : wire->sent)
+	{
+		const auto message = json::parse(line).root;
+
+		if (message["id"].integer() != 51 && message["id"].integer() != 52)
+			continue;
+
+		// The protocol spells an abandoned permission request 'cancelled', not an error
+		if (message["result"]["outcome"]["outcome"].text() == "cancelled")
+			++refused;
+	}
+
+	should::is_equal(2, refused, "every dropped question was answered");
+}
+
+// A second message while the agent is working is kept, not refused
+static void should_queue_prompts_while_the_agent_works()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->submit("first");
+	const auto prompt_id = wire->last_id();
+	const auto sent = wire->sent.size();
+
+	host->submit("second");
+	should::is_equal(size_t{1}, host->queued_prompt_count(), "held until the turn ends");
+	should::is_equal(sent, wire->sent.size(), "nothing sent mid-turn");
+	should::is_equal_true(sink.status.find("queued") != std::string::npos, "the status says so");
+	should::is_equal_true(sink.text().find("second") != std::string::npos, "still recorded in the transcript");
+
+	host->on_agent_line(std::format(R"({{"jsonrpc":"2.0","id":{},"result":{{"stopReason":"end_turn"}}}})", prompt_id));
+
+	const auto followed = wire->last();
+	should::is_equal("session/prompt", followed["method"].text(), "the queued message follows");
+	should::is_equal("second", followed["params"]["prompt"][0]["text"].text(), "and it is the one that waited");
+	should::is_equal(size_t{0}, host->queued_prompt_count(), "queue drained");
+}
+
+// cwd is fixed when the session is made, so a new folder has to mean a new session
+static void should_start_a_new_session_when_the_folder_changes()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->set_working_dir(pf::file_path{"C:\\work"});
+	should::is_equal_true(host->connected(), "the same folder changes nothing");
+
+	host->set_working_dir(pf::file_path{"C:\\other"});
+	should::is_equal(false, host->connected(), "the old session is dropped");
+	should::is_equal_true(sink.text().find("C:\\other") != std::string::npos, "and it is written down");
+}
+
+// What the user is looking at is sent with every prompt, since it changes between them
+static void should_send_editor_context_with_a_prompt()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	host->gather_context = [] { return std::string("- open file: `src/app.cpp`\n- caret: line 12\n"); };
+
+	host->submit("explain this");
+
+	const auto blocks = wire->last()["params"]["prompt"];
+	should::is_equal(size_t{2}, blocks.size(), "context rides ahead of the prompt");
+	should::is_equal_true(blocks[0]["text"].text().find("src/app.cpp") != std::string_view::npos,
+	                      "the open file is named");
+	should::is_equal("explain this", blocks[1]["text"].text(), "the prompt itself is untouched");
+}
+
+static void should_serve_agent_file_requests()
+{
+	collecting_sink sink;
+	recording_transport* wire = nullptr;
+	const auto host = connected_host(sink, wire);
+
+	sink.files["C:\\work\\a.txt"] = "one\ntwo\nthree\nfour";
+
+	// The capabilities we advertised are what make the agent ask us at all
+	const auto init = wire->message(0);
+	should::is_equal_true(init["params"]["clientCapabilities"]["fs"]["readTextFile"].boolean(), "reads offered");
+	should::is_equal_true(init["params"]["clientCapabilities"]["fs"]["writeTextFile"].boolean(), "writes offered");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":5,"method":"fs/read_text_file","params":{"path":"C:\\work\\a.txt"}})");
+	should::is_equal("one\ntwo\nthree\nfour", wire->last()["result"]["content"].text(), "whole file");
+
+	// A window into the file, counted in 1-based lines
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":6,"method":"fs/read_text_file","params":{"path":"C:\\work\\a.txt","line":2,"limit":2}})");
+	should::is_equal("two\nthree", wire->last()["result"]["content"].text(), "line window");
+
+	// A window running past the end is clamped rather than failing
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":7,"method":"fs/read_text_file","params":{"path":"C:\\work\\a.txt","line":4,"limit":99}})");
+	should::is_equal("four", wire->last()["result"]["content"].text(), "clamped window");
+
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":8,"method":"fs/write_text_file","params":{"path":"C:\\work\\b.txt","content":"written"}})");
+	should::is_equal("written", sink.files["C:\\work\\b.txt"], "file written");
+	should::is_equal_true(wire->last()["error"].is_null(), "reported success");
+
+	// A refused path is an error the agent can act on, not silence
+	sink.refuse_files = true;
+	host->on_agent_line(
+		R"({"jsonrpc":"2.0","id":9,"method":"fs/read_text_file","params":{"path":"C:\\elsewhere\\secrets"}})");
+	should::is_equal(acp::error_code::invalid_request, static_cast<int>(wire->last()["error"]["code"].integer()),
+	                 "refusal reported");
+	should::is_equal_true(wire->last()["error"]["message"].text().find("outside") != std::string_view::npos,
+	                      "says why");
+
+	// An unknown request still gets an answer
+	host->on_agent_line(R"({"jsonrpc":"2.0","id":10,"method":"terminal/create","params":{}})");
+	should::is_equal(acp::error_code::method_not_found, static_cast<int>(wire->last()["error"]["code"].integer()),
+	                 "unsupported method refused");
+}
+
+// The agent must not be able to reach outside the folder that is open
+static void should_refuse_agent_paths_outside_the_root()
+{
+	const auto state = create_test_app();
+	const auto root = create_temp_test_root();
+
+	const auto root_item = std::make_shared<index_item>(root, root.name(), true);
+	state->set_root(root_item);
+
+	std::string error;
+	should::is_equal_true(state->agent_path_allowed(root.combine("inside.txt"), error), "inside is allowed");
+	should::is_equal_true(state->agent_path_allowed(root.combine("sub").combine("deep.txt"), error),
+	                      "nested is allowed");
+
+	should::is_equal(false, state->agent_path_allowed(pf::file_path{"C:\\Windows\\system.ini"}, error),
+	                 "elsewhere is refused");
+	should::is_equal_true(!error.empty(), "refusal explains itself");
+
+	// Traversal is resolved before the check, so it cannot escape
+	should::is_equal(false, state->agent_path_allowed(root.combine("..").combine("escaped.txt"), error),
+	                 "parent traversal refused");
+	should::is_equal(false, state->agent_path_allowed(pf::file_path{}, error), "empty path refused");
+
+	pf::platform_recycle_file(root);
+}
+
+// An agent edit to an open file goes through undo, and its reads see unsaved work
+static void should_route_agent_edits_through_the_document()
+{
+	const auto state = create_test_app();
+	const auto root = create_temp_test_root();
+	const auto path = root.combine("code.txt");
+	write_test_text_file(path, "original");
+
+	const auto root_item = std::make_shared<index_item>(root, root.name(), true);
+	const auto item = std::make_shared<index_item>(path, path.name(), false,
+	                                               std::make_shared<document>(null_ev, "unsaved edit"));
+	root_item->children.push_back(item);
+	state->set_root(root_item);
+
+	std::string content;
+	std::string error;
+
+	should::is_equal_true(state->agent_read_file(path, content, error), "read allowed");
+	should::is_equal("unsaved edit", content, "serves the open document, not the disk");
+
+	should::is_equal_true(state->agent_write_file(path, "agent wrote this", error), "write allowed");
+	should::is_equal("agent wrote this", item->doc->str(), "document updated");
+	should::is_equal_true(item->doc->is_modified(), "shows as modified");
+
+	item->doc->undo();
+	should::is_equal("unsaved edit", item->doc->str(), "the edit can be undone");
+
+	// A read-only document refuses the write outright
+	item->doc->read_only(true);
+	should::is_equal(false, state->agent_write_file(path, "nope", error), "read only refused");
+	should::is_equal_true(error.find("read only") != std::string::npos, "says why");
+
+	pf::platform_recycle_file(root);
+}
+
+static void should_build_the_tools_menu_from_the_script()
+{
+	const auto state = std::make_shared<app_state>(std::make_shared<sync_scheduler>());
+	state->_powershell = pf::file_path{R"(C:\pwsh.exe)"};
+	state->_script_path = pf::file_path{R"(C:\root\dd.ps1)"};
+	state->_script.commands = {"run", "build", "clean"};
+	state->_script.options = {{"Config", {"Debug", "Release"}}};
+
+	const auto items = state->build_tools_menu();
+
+	should::is_equal(size_t{11}, items.size(), "three commands, the option submenu, and the fixed items");
+	should::is_equal("run", items[0].text);
+	should::is_equal("clean", items[2].text);
+	should::is_equal("Config", items[4].text);
+	should::is_equal(size_t{2}, items[4].children.size());
+	should::is_equal_true(items[4].children[0].is_checked(), "the first value is the default");
+	should::is_equal(false, items[4].children[1].is_checked(), "and only one is checked");
+}
+
+static void should_offer_no_tools_without_a_script()
+{
+	const auto state = std::make_shared<app_state>(std::make_shared<sync_scheduler>());
+	const auto items = state->build_tools_menu();
+
+	should::is_equal(size_t{7}, items.size());
+	should::is_equal_true(items[0].text.starts_with("(No dd.ps1"), "it says why");
+	should::is_equal(false, items[0].is_enabled(), "and is disabled");
+}
+
+static void should_step_through_diagnostics()
+{
+	using state = app_state;
+
+	should::is_equal(-1, state::step_diagnostic_index(0, -1, 1), "nothing to visit");
+	should::is_equal(0, state::step_diagnostic_index(3, -1, 1), "forward starts at the first");
+	should::is_equal(2, state::step_diagnostic_index(3, -1, -1), "backward starts at the last");
+	should::is_equal(1, state::step_diagnostic_index(3, 0, 1));
+	should::is_equal(0, state::step_diagnostic_index(3, 2, 1), "and wraps round");
+	should::is_equal(2, state::step_diagnostic_index(3, 0, -1), "in both directions");
+}
+
+static void should_resolve_a_diagnostic_path()
+{
+	const pf::file_path root{R"(C:\root)"};
+
+	should::is_equal(R"(C:\root\src\a.cpp)",
+	                 app_state::resolve_diagnostic_path(root, "src/a.cpp").view(),
+	                 "a relative path is rooted at the working directory");
+	should::is_equal(R"(D:\other\b.cpp)",
+	                 app_state::resolve_diagnostic_path(root, R"(D:\other\b.cpp)").view(),
+	                 "an absolute path is left alone");
+	should::is_equal(R"(\\server\share\c.cpp)",
+	                 app_state::resolve_diagnostic_path(root, R"(\\server\share\c.cpp)").view(),
+	                 "and so is a UNC path");
+	should::is_equal_true(app_state::resolve_diagnostic_path(root, "").empty(), "no file, no path");
+	should::is_equal_true(app_state::resolve_diagnostic_path({}, "a.cpp").empty(), "nor without a root");
+}
+
+static void should_recognise_indexable_sources()
+{
+	should::is_equal_true(app_state::is_indexable_source(R"(C:\a\b.cpp)"), "a source file");
+	should::is_equal_true(app_state::is_indexable_source("b.H"), "case does not matter");
+	should::is_equal(false, app_state::is_indexable_source("readme.md"), "markdown is not C++");
+	should::is_equal(false, app_state::is_indexable_source("Makefile"), "nor a file with no extension");
+	should::is_equal(false, app_state::is_indexable_source(R"(C:\a.h\b)"), "a dot in a folder is not one");
+}
+
+static void should_name_the_header_and_source_counterparts()
+{
+	const auto from_source = app_state::counterpart_names("app.cpp");
+	should::is_equal_true(!from_source.empty(), "a source file has counterparts");
+	should::is_equal("app.h", from_source[0], "the header is tried first");
+
+	const auto from_header = app_state::counterpart_names("app.h");
+	should::is_equal("app.cpp", from_header[0], "and the source from the header");
+	should::is_equal_true(std::ranges::find(from_header, "app.ixx") != from_header.end(),
+		"module interfaces are also sources");
+
+	should::is_equal_true(app_state::counterpart_names("Makefile").empty(), "no extension, no counterpart");
+}
+
+static void should_rank_a_definition_above_a_declaration()
+{
+	const auto state = std::make_shared<app_state>(std::make_shared<sync_scheduler>());
+	auto idx = std::make_shared<cpp::index>();
+
+	idx->update_file(idx->add_file("a.h"), "void f();");
+	idx->update_file(idx->add_file("b.cpp"), "void f() {}");
+	state->_cpp_index = idx;
+
+	const auto ranked = state->rank_candidates(idx->find("f"));
+	should::is_equal(size_t{2}, ranked.size(), "both are candidates");
+	should::is_equal_true((ranked[0].flags & cpp::symbol_flag::definition) != 0, "the definition comes first");
+}
+
+static void should_track_back_and_forward()
+{
+	const auto state = std::make_shared<app_state>(std::make_shared<sync_scheduler>());
+
+	should::is_equal(false, state->can_go_back(), "nowhere to go back to at first");
+	should::is_equal(false, state->can_go_forward());
+
+	state->go_back(); // reports, and does not reach for an empty stack
+
+	state->_active_item = std::make_shared<index_item>(pf::file_path{R"(C:\root\a.cpp)"}, "a.cpp", false, nullptr);
+	state->record_location();
+
+	should::is_equal_true(state->can_go_back(), "a jump remembers where it left");
+	should::is_equal(false, state->can_go_forward(), "and discards anything that was ahead");
+}
+
+static std::shared_ptr<app_state> create_navigation_app(
+	async_scheduler_ptr scheduler = std::make_shared<sync_scheduler>())
+{
+	const auto state = std::make_shared<app_state>(std::move(scheduler));
+	state->_app_window = std::make_shared<stub_window_frame>();
+	state->_doc_window = std::make_shared<stub_window_frame>();
+	state->_list_window = std::make_shared<stub_window_frame>();
+	state->_agent_window = std::make_shared<stub_window_frame>();
+	state->_agent_input_window = std::make_shared<stub_window_frame>();
+	state->set_root(std::make_shared<index_item>(pf::file_path{R"(C:\navigation-unit-tests)"}, "root", true));
+	state->_doc_window->set_focus();
+	return state;
+}
+
+static index_item_ptr add_navigation_document(const std::shared_ptr<app_state>& state,
+	const std::string_view name, const std::string_view text)
+{
+	const auto path = state->root_item()->path.combine(name);
+	const auto item = std::make_shared<index_item>(path, path.name(), false,
+		std::make_shared<document>(null_ev, text));
+	state->root_item()->children.push_back(item);
+	return item;
+}
+
+static void should_gate_navigation_to_the_cpp_editor()
+{
+	const auto state = create_navigation_app();
+	const auto item = add_navigation_document(state, "test.cpp", "void f();");
+	state->set_active_item(item);
+	const auto definition = state->command_menu_item(command_id::nav_go_to_definition);
+	const auto counterpart = state->command_menu_item(command_id::nav_switch_header_source);
+	should::is_equal_true(definition.is_enabled() && counterpart.is_enabled(), "C++ editor is enabled");
+	item->doc->read_only(true);
+	should::is_equal_true(definition.is_enabled(), "read-only source still supports navigation");
+
+	state->_list_window->set_focus();
+	should::is_equal(false, definition.is_enabled(), "file and search lists do not navigate an invisible caret");
+	state->_agent_visible = true;
+	state->_agent_input_window->set_focus();
+	should::is_equal(false, definition.is_enabled(), "agent input cannot navigate the editor");
+	state->_agent_window->set_focus();
+	should::is_equal(false, counterpart.is_enabled(), "nor the transcript");
+	state->_doc_window->set_focus();
+	state->set_mode(view_mode::markdown_files);
+	should::is_equal(false, definition.is_enabled(), "previews have no source caret");
+	state->set_active_item(add_navigation_document(state, "test.txt", "f"));
+	should::is_equal(false, counterpart.is_enabled(), "plain text is not a source file");
+	should::is_equal_true(app_state::counterpart_names("test.txt").empty(), "unsupported extension has no counterpart");
+}
+
+static void should_display_navigation_shortcuts_as_named_keys()
+{
+	for (unsigned int i = 0; i < 12; ++i)
+		should::is_equal(std::format("F{}", i + 1),
+			pf::format_key_binding({pf::platform_key::F1 + i, pf::key_mod::none}), "function key name");
+	should::is_equal("Ctrl+F12", pf::format_key_binding({pf::platform_key::F12, pf::key_mod::ctrl}));
+	should::is_equal("Shift+F8", pf::format_key_binding({pf::platform_key::F8, pf::key_mod::shift}));
+	should::is_equal("Alt+Left", pf::format_key_binding({pf::platform_key::Left, pf::key_mod::alt}));
+	should::is_equal("Alt+Right", pf::format_key_binding({pf::platform_key::Right, pf::key_mod::alt}));
+}
+
+class navigation_test_view final : public edit_doc_view
+{
+public:
+	using edit_doc_view::edit_doc_view;
+	using doc_view::text_to_client;
+};
+
+static void should_navigate_the_right_clicked_name_without_losing_copy_selection()
+{
+	const auto state = create_navigation_app();
+	const auto caller = add_navigation_document(state, "caller.cpp", "caf\xC3\xA9 target other");
+	const auto target = add_navigation_document(state, "target.cpp", "void target() {}");
+	state->set_active_item(caller);
+	state->_cpp_index = std::make_shared<cpp::index>();
+	state->reindex_open_documents();
+	const auto view = std::make_shared<navigation_test_view>(*state);
+	view->set_document(caller->doc);
+	state->_doc_view = view;
+	stub_measure_context measure;
+	view->handle_size(state->_doc_window, {480, 320}, measure);
+	caller->doc->select(caller->doc->all());
+	const auto selected = caller->doc->selection();
+	const auto point = view->text_to_client({7, 0});
+	state->_agent_visible = true;
+	state->_agent_input_window->set_focus();
+	pf::mouse_params params{};
+	params.point = point;
+	view->handle_mouse(state->_doc_window, pf::mouse_message_type::right_button_down, params);
+	should::is_equal_true(state->_doc_window->has_focus(), "right-click focuses its pane");
+	should::is_equal(selected._start.x, caller->doc->selection()._start.x, "copy selection start retained");
+	should::is_equal(selected._end.x, caller->doc->selection()._end.x, "copy selection end retained");
+	const auto menu = view->on_popup_menu(point);
+	const auto lookup = [&](const command_id id) -> const pf::menu_command&
+	{
+		const auto found = std::ranges::find_if(menu, [&](const pf::menu_command& command)
+		{
+			return command.id == static_cast<int>(id);
+		});
+		should::is_equal_true(found != menu.end(), "menu command exists");
+		return *found;
+	};
+	should::is_equal(static_cast<int>(pf::platform_key::F12),
+		static_cast<int>(lookup(command_id::nav_go_to_definition).accel.key),
+		"popup retains the command binding");
+	(void)lookup(command_id::nav_switch_header_source);
+	(void)lookup(command_id::edit_copy);
+	(void)lookup(command_id::edit_undo);
+	(void)lookup(command_id::edit_select_all);
+	lookup(command_id::nav_go_to_definition).action();
+	should::is_equal_true(state->active_item() == target, "clicked name wins over the caret at selection end");
+	should::is_equal("target", target->doc->copy(), "definition selected");
+	should::is_equal(7, state->_back.back().column, "history uses the clicked UTF-8 byte offset");
+
+	state->set_active_item(caller);
+	caller->doc->select(text_location{1, 0});
+	params.point = view->text_to_client({7, 0});
+	view->handle_mouse(state->_doc_window, pf::mouse_message_type::right_button_down, params);
+	should::is_equal(7, caller->doc->cursor_pos().x, "click outside selection moves to the UTF-8 byte target");
+	params.point = {-1, -1};
+	view->handle_mouse(state->_doc_window, pf::mouse_message_type::context_menu, params);
+	const auto window = std::static_pointer_cast<stub_window_frame>(state->_doc_window);
+	should::is_equal(static_cast<int>(command_id::nav_go_to_definition), window->popup_items.front().id,
+		"keyboard popup also offers navigation");
+	const auto caret_point = view->text_to_client(caller->doc->cursor_pos());
+	should::is_equal(caret_point.x, window->popup_point.x, "keyboard popup is positioned at the caret");
+	should::is_equal(caret_point.y, window->popup_point.y, "keyboard popup is positioned at the caret");
+	window->popup_items.front().action();
+	should::is_equal_true(state->active_item() == target, "keyboard popup uses the current caret");
+	state->_agent_input_window->set_focus();
+	const auto input_menu = state->_agent_input_view->on_popup_menu({});
+	should::is_equal(false, std::ranges::any_of(input_menu, [](const pf::menu_command& command)
+	{
+		return command.id == static_cast<int>(command_id::nav_go_to_definition);
+	}), "agent popup remains an editing menu");
+}
+
+static void should_cycle_definitions_without_reranking_the_destination_first()
+{
+	const auto state = create_navigation_app();
+	const auto a = add_navigation_document(state, "a.cpp", "void f() {}");
+	const auto b = add_navigation_document(state, "b.cpp", "void f() {}");
+	const auto c = add_navigation_document(state, "c.cpp", "void f() {}");
+	state->set_active_item(c);
+	c->doc->select(text_location{5, 0});
+	state->_cpp_index = std::make_shared<cpp::index>();
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == c, "current file wins first");
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == a, "next candidate");
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == b, "third candidate does not repeat the current file");
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == c, "cycle wraps");
+	c->doc->select(text_location{5, 0});
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == c, "moving the caret starts a fresh lookup");
+}
+
+static void should_refresh_unsaved_and_undone_inactive_sources()
+{
+	const auto state = create_navigation_app();
+	const auto header = add_navigation_document(state, "test.h", "void before();");
+	const auto caller = add_navigation_document(state, "test.cpp", "after");
+	state->set_active_item(caller);
+	state->_cpp_index = std::make_shared<cpp::index>();
+	state->reindex_open_documents();
+	{
+		undo_group group(header->doc);
+		header->doc->replace_text(group, header->doc->all(), "void after();");
+	}
+	state->go_to_definition();
+	should::is_equal_true(state->active_item() == header, "lookup sees an inactive unsaved declaration");
+	should::is_equal(size_t{0}, state->_cpp_index->find("before").size(), "old declaration removed");
+	header->doc->undo();
+	should::is_equal(false, header->doc->is_modified(), "undo reached saved text");
+	state->reindex_open_documents();
+	should::is_equal(size_t{1}, state->_cpp_index->find("before").size(), "clean undo updates the index");
+	should::is_equal(size_t{0}, state->_cpp_index->find("after").size(), "undone declaration removed");
+}
+
+static void should_discard_cpp_index_work_for_a_previous_root()
+{
+	const auto scheduler = std::make_shared<deferred_scheduler>();
+	const auto state = create_navigation_app(scheduler);
+	const auto old = add_navigation_document(state, "old.cpp", "void old_name();");
+	state->set_active_item(old);
+	state->record_location();
+	state->rebuild_cpp_index();
+	state->set_root(std::make_shared<index_item>(pf::file_path{R"(C:\another-navigation-root)"}, "next", true));
+	state->rebuild_cpp_index();
+	scheduler->pump();
+	should::is_equal_true(!state->_cpp_index, "empty new root cannot receive the previous worker result");
+	should::is_equal(false, state->can_go_back(), "old root history is cleared");
+
+	const auto fresh = add_navigation_document(state, "fresh.cpp", "void initial();");
+	state->rebuild_cpp_index();
+	{
+		undo_group group(fresh->doc);
+		fresh->doc->replace_text(group, fresh->doc->all(), "void latest();");
+	}
+	scheduler->pump();
+	should::is_equal(size_t{1}, state->_cpp_index->find("latest").size(), "publish merges current unsaved text");
+	should::is_equal(size_t{0}, state->_cpp_index->find("initial").size(), "stale snapshot cannot replace edits");
+}
+
+static void should_skip_stale_navigation_history_and_clamp_utf8_positions()
+{
+	const auto state = create_navigation_app();
+	const auto a = add_navigation_document(state, "a.cpp", "caf\xC3\xA9");
+	const auto b = add_navigation_document(state, "b.cpp", "void b();");
+	state->set_active_item(b);
+	state->_back = {{a->path, 100, 4}, {state->root_item()->path.combine("missing.cpp"), 0, 0}};
+	state->_list_window->set_focus();
+	state->go_back();
+	should::is_equal_true(state->active_item() == a, "stale entries are skipped");
+	should::is_equal_true(state->_doc_window->has_focus(), "history returns focus to the document");
+	should::is_equal(0, a->doc->cursor_pos().y, "line clamped after document shrinks");
+	should::is_equal(3, a->doc->cursor_pos().x, "column snaps to the UTF-8 leading byte");
+	should::is_equal(size_t{1}, state->_forward.size(), "only a successful jump adds forward history");
+	state->go_forward();
+	should::is_equal_true(state->active_item() == b, "forward restores the destination");
+	state->_forward.push_back({state->root_item()->path.combine("gone.cpp"), 0, 0});
+	const auto back_size = state->_back.size();
+	state->go_forward();
+	should::is_equal(back_size, state->_back.size(), "missing forward target adds no bogus back entry");
+}
+
+static void should_prefer_live_sibling_counterparts()
+{
+	const auto state = create_navigation_app();
+	const auto header = add_navigation_document(state, "test.h", "void f();");
+	const auto deleted = add_navigation_document(state, "test.cpp", "");
+	deleted->is_deleted = true;
+	const auto sibling = add_navigation_document(state, "test.cc", "void f() {}");
+	state->set_active_item(header);
+	state->switch_header_source();
+	should::is_equal_true(state->active_item() == sibling, "deleted preferred extension cannot hide a live sibling");
+	should::is_equal(size_t{1}, state->_back.size(), "switch records the source position");
+}
+
+static void should_navigate_utf16_sources_after_deferred_and_repeated_loads()
+{
+	const auto scratch = pf::current_directory().combine("tmp");
+	if (!scratch.exists())
+		pf::platform_create_directory(scratch);
+	const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto path = scratch.combine(std::format("cpp-navigation-{}.cpp", unique));
+	std::string encoded{"\xFF\xFE", 2};
+	for (const auto c : std::string_view("void loaded() {}\r\nvoid other() {}\r\n"))
+	{
+		encoded += c;
+		encoded += '\0';
+	}
+	write_test_text_file(path, encoded);
+
+	const auto scheduler = std::make_shared<deferred_scheduler>();
+	const auto state = create_navigation_app(scheduler);
+	state->set_root(std::make_shared<index_item>(scratch, scratch.name(), true));
+	const auto target = std::make_shared<index_item>(path, path.name(), false);
+	state->root_item()->children.push_back(target);
+	const auto caller = add_navigation_document(state, "caller.cpp", "loaded");
+	state->set_active_item(caller);
+	state->rebuild_cpp_index();
+	scheduler->pump();
+	should::is_equal(size_t{1}, state->_cpp_index->find("loaded").size(), "disk index decodes UTF-16");
+
+	state->go_to_definition();
+	scheduler->pump();
+	should::is_equal_true(state->active_item() == target, "deferred definition opens the target");
+	should::is_equal("loaded", target->doc->copy(), "symbol is selected after disk load");
+	should::is_equal_true(state->message_bar_text().find("loaded") != std::string_view::npos,
+		"load completion retains the navigation description");
+
+	state->set_active_item(caller);
+	target->doc.reset();
+	state->open_path_and_select(target, 0, 5, 6);
+	state->open_path_and_select(target, 1, 5, 5, "latest navigation");
+	scheduler->pump();
+	should::is_equal("other", target->doc->copy(), "newer jump waits for an already pending load");
+	should::is_equal(1, target->doc->selection()._start.y, "newer jump wins");
+	should::is_equal("latest navigation", state->message_bar_text(), "newer description wins too");
+	pf::platform_recycle_file(path);
+}
+
+tests::run_result run_all_tests_result(){
 	tests tests;
 
 	// Document tests
@@ -2139,6 +4474,104 @@ tests::run_result run_all_tests_result()
 	// Calculator tests
 	tests.register_test("should calc expressions", should_calc_expressions);
 	tests.register_test("should calc reject bad input", should_calc_rejects_bad_input);
+
+	// JSON tests
+	tests.register_test("should json round trip", should_json_round_trip);
+	tests.register_test("should json read members", should_json_read_members);
+	tests.register_test("should json accessors fall back", should_json_accessors_fall_back);
+	tests.register_test("should json parse escapes", should_json_parse_escapes);
+	tests.register_test("should json replace lone surrogates", should_json_replace_lone_surrogates);
+	tests.register_test("should json escape control characters", should_json_escape_control_characters);
+	tests.register_test("should json keep integers exact", should_json_keep_integers_exact);
+	tests.register_test("should json reject bad numbers", should_json_reject_bad_numbers);
+	tests.register_test("should json reject malformed input", should_json_reject_malformed_input);
+	tests.register_test("should json limit nesting depth", should_json_limit_nesting_depth);
+	tests.register_test("should json build messages", should_json_build_messages);
+	tests.register_test("should json replace duplicate keys", should_json_replace_duplicate_keys);
+	tests.register_test("should json pass through utf8", should_json_pass_through_utf8);
+
+	// ACP protocol tests
+	tests.register_test("should acp complete handshake", should_acp_complete_handshake);
+	tests.register_test("should acp report handshake failure", should_acp_report_handshake_failure);
+	tests.register_test("should acp send prompt and end turn", should_acp_send_prompt_and_end_turn);
+	tests.register_test("should acp refuse prompt before ready", should_acp_refuse_prompt_before_ready);
+	tests.register_test("should acp cancel turn", should_acp_cancel_turn);
+	tests.register_test("should acp dispatch session updates", should_acp_dispatch_session_updates);
+	tests.register_test("should acp answer permission requests", should_acp_answer_permission_requests);
+	tests.register_test("should acp reject unknown requests", should_acp_reject_unknown_requests);
+	tests.register_test("should acp survive malformed input", should_acp_survive_malformed_input);
+	tests.register_test("should acp fail pending requests on disconnect",
+	                    should_acp_fail_pending_requests_on_disconnect);
+	tests.register_test("should acp parse stop reasons", should_acp_parse_stop_reasons);
+
+	// session.md tests
+	tests.register_test("should session round trip exactly", should_session_round_trip_exactly);
+	tests.register_test("should session parse entries", should_session_parse_entries);
+	tests.register_test("should session keep agent markdown inside its entry",
+	                    should_session_keep_agent_markdown_inside_its_entry);
+	tests.register_test("should session escape heading like body", should_session_escape_heading_like_body);
+	tests.register_test("should session read options", should_session_read_options);
+	tests.register_test("should session set options preserving unknown keys",
+	                    should_session_set_options_preserving_unknown_keys);
+	tests.register_test("should session choose option", should_session_choose_option);
+	tests.register_test("should session append entries and chunks", should_session_append_entries_and_chunks);
+	tests.register_test("should session survive hand mangled files", should_session_survive_hand_mangled_files);
+	tests.register_test("should parse slash commands", should_parse_slash_commands);
+	tests.register_test("should generate help from the command table",
+	                    should_generate_help_from_the_command_table);
+	tests.register_test("should read advertised commands", should_read_advertised_commands);
+	tests.register_test("should stream chunks into one line", should_stream_chunks_into_one_line);
+	tests.register_test("should track tool call lifecycle", should_track_tool_call_lifecycle);
+	tests.register_test("should write plans as options", should_write_plans_as_options);
+	tests.register_test("should ignore unknown updates", should_ignore_unknown_updates);
+
+	// Agent panel tests
+	tests.register_test("should clamp agent splitter to the document pane",
+	                    should_clamp_agent_splitter_to_the_document_pane);
+	tests.register_test("should keep the scrollbar thumb inside the track",
+	                    should_keep_the_scrollbar_thumb_inside_the_track);
+	tests.register_test("should scroll the agent transcript", should_scroll_the_agent_transcript);
+	tests.register_test("should grow agent input to five rows", should_grow_agent_input_to_five_rows);
+	tests.register_test("should edit the agent prompt like a document",
+	                    should_edit_the_agent_prompt_like_a_document);
+	tests.register_test("should keep the session document separate from the editor",
+	                    should_keep_the_session_document_separate_from_the_editor);
+	tests.register_test("should handle agent slash commands in the panel",
+	                    should_handle_agent_slash_commands_in_the_panel);
+	tests.register_test("should reload the transcript and reset yolo",
+	                    should_reload_the_transcript_and_reset_yolo);
+	tests.register_test("should run an agent turn", should_run_an_agent_turn);
+	tests.register_test("should patch only the tail while streaming",
+	                    should_patch_only_the_tail_while_streaming);
+	tests.register_test("should ask before running a tool", should_ask_before_running_a_tool);
+	tests.register_test("should queue questions asked at once", should_queue_questions_asked_at_once);
+	tests.register_test("should refuse pending questions when cleared",
+	                    should_refuse_pending_questions_when_cleared);
+	tests.register_test("should queue prompts while the agent works",
+	                    should_queue_prompts_while_the_agent_works);
+	tests.register_test("should replay earlier conversation to a new session",
+	                    should_replay_earlier_conversation_to_a_new_session);
+	tests.register_test("should replay the conversation after the agent dies",
+	                    should_replay_the_conversation_after_the_agent_dies);
+	tests.register_test("should start a new session when the folder changes",
+	                    should_start_a_new_session_when_the_folder_changes);
+	tests.register_test("should send editor context with a prompt", should_send_editor_context_with_a_prompt);
+	tests.register_test("should digest a transcript", should_digest_a_transcript);
+	tests.register_test("should refuse a newer protocol", should_refuse_a_newer_protocol);
+	tests.register_test("should answer a question by selection", should_answer_a_question_by_selection);
+	tests.register_test("should auto approve only in yolo mode", should_auto_approve_only_in_yolo_mode);
+	tests.register_test("should stop a running turn", should_stop_a_running_turn);
+	tests.register_test("should settle everything the turn left open",
+	                    should_settle_everything_the_turn_left_open);
+	tests.register_test("should keep streaming across a queued message",
+	                    should_keep_streaming_across_a_queued_message);
+	tests.register_test("should offer a model choice", should_offer_a_model_choice);
+	tests.register_test("should report a lost agent", should_report_a_lost_agent);
+	tests.register_test("should serve agent file requests", should_serve_agent_file_requests);
+	tests.register_test("should refuse agent paths outside the root",
+	                    should_refuse_agent_paths_outside_the_root);
+	tests.register_test("should route agent edits through the document",
+	                    should_route_agent_edits_through_the_document);
 
 	// String utility tests
 	tests.register_test("should to_lower", should_to_lower);
@@ -2274,6 +4707,39 @@ tests::run_result run_all_tests_result()
 	tests.register_test("should splice wrap when an edit is undone", should_splice_wrap_when_an_edit_is_undone);
 	tests.register_test("should rewrap a dirty line that a later split moved",
 	                    should_rewrap_a_dirty_line_that_a_later_split_moved);
+
+	// Tools menu
+	tests.register_test("should build the tools menu from the script",
+	                    should_build_the_tools_menu_from_the_script);
+	tests.register_test("should offer no tools without a script", should_offer_no_tools_without_a_script);
+	tests.register_test("should step through diagnostics", should_step_through_diagnostics);
+	tests.register_test("should resolve a diagnostic path", should_resolve_a_diagnostic_path);
+
+	// Navigation
+	tests.register_test("should recognise indexable sources", should_recognise_indexable_sources);
+	tests.register_test("should name the header and source counterparts",
+	                    should_name_the_header_and_source_counterparts);
+	tests.register_test("should rank a definition above a declaration",
+	                    should_rank_a_definition_above_a_declaration);
+	tests.register_test("should track back and forward", should_track_back_and_forward);
+	tests.register_test("should gate navigation to the C++ editor", should_gate_navigation_to_the_cpp_editor);
+	tests.register_test("should display navigation shortcuts as named keys",
+		should_display_navigation_shortcuts_as_named_keys);
+	tests.register_test("should navigate the right-clicked name without losing copy selection",
+		should_navigate_the_right_clicked_name_without_losing_copy_selection);
+	tests.register_test("should cycle definitions without reranking the destination first",
+		should_cycle_definitions_without_reranking_the_destination_first);
+	tests.register_test("should refresh unsaved and undone inactive sources",
+		should_refresh_unsaved_and_undone_inactive_sources);
+	tests.register_test("should discard C++ index work for a previous root",
+		should_discard_cpp_index_work_for_a_previous_root);
+	tests.register_test("should skip stale navigation history and clamp UTF-8 positions",
+		should_skip_stale_navigation_history_and_clamp_utf8_positions);
+	tests.register_test("should prefer live sibling counterparts", should_prefer_live_sibling_counterparts);
+	tests.register_test("should navigate UTF-16 sources after deferred and repeated loads",
+		should_navigate_utf16_sources_after_deferred_and_repeated_loads);
+
+	register_cpp_tests(tests);
 
 	auto result = tests.run_all_result();
 	result.output = "# Test results\n\n" + result.output;

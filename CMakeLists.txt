@@ -34,12 +34,21 @@ FetchContent_MakeAvailable(platform_h)
 
 platform_add_app(rethinkify
     SOURCES
+        src/acp.cpp
+        src/agent_host.cpp
+        src/agent_session.cpp
         src/app.cpp
         src/app_commands.cpp
         src/commands.cpp
+        src/cpp_index.cpp
+        src/cpp_lex.cpp
         src/document.cpp
         src/document_syntax.cpp
+        src/json.cpp
         src/tests.cpp
+        src/tests_cpp.cpp
+        src/tool_output.cpp
+        src/tool_runner.cpp
         src/util.cpp
     ICON        src/res/app.ico
     DESCRIPTION "Rethinkify text editor"
@@ -66,7 +75,10 @@ target_precompile_headers(rethinkify PRIVATE src/pch.h)
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(noterad_tests tests/smoke.cpp)
-    add_test(NAME noterad_unit COMMAND noterad_tests)
-    set_tests_properties(noterad_unit PROPERTIES TIMEOUT 30 LABELS noterad)
+    add_test(NAME rethinkify.unit COMMAND rethinkify /test)
+    set_tests_properties(rethinkify.unit PROPERTIES
+        LABELS "rethinkify;unit"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        TIMEOUT 120
+    )
 endif()

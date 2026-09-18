@@ -14,8 +14,11 @@
 #include "view_doc_markdown.h"
 #include "view_doc_hex.h"
 #include "view_doc_csv.h"
+#include "view_agent.h"
+#include "view_agent_input.h"
 
 #include "app_state.h"
+#include "acp.h"
 #include "test.h"
 
 std::string g_app_name = "Rethinkify";
@@ -318,6 +321,9 @@ namespace
 
 	constexpr int recent_root_folder_menu_id_base = 20000;
 
+	// Rebuilt with the Tools menu whenever the project model changes
+	constexpr int tool_menu_id_base = 21000;
+
 	std::string escape_menu_text(const std::string_view text)
 	{
 		return replace(std::string(text), "&", "&&");
@@ -488,18 +494,157 @@ namespace
 		const auto result = std::from_chars(text.data(), end, out);
 		return result.ec == std::errc{} && result.ptr == end;
 	}
+
+	// Reads a whole text file, dropping a UTF-8 BOM. Refuses anything larger than 'max_bytes'.
+	bool read_file_text(const pf::file_path& path, std::string& out, const uint32_t max_bytes)
+	{
+		const auto file = pf::open_for_read(path);
+
+		if (!file)
+			return false;
+
+		const auto size = file->size();
+
+		if (size > max_bytes)
+			return false;
+
+		out.resize(size);
+		uint32_t read = 0;
+
+		if (size > 0 && !file->read(reinterpret_cast<uint8_t*>(out.data()), size, &read))
+			return false;
+
+		out.resize(read);
+
+		if (out.starts_with("\xEF\xBB\xBF"))
+			out.erase(0, 3);
+
+		return true;
+	}
 }
+
+// agent_doc_events — Routes the session document's events to the agent pane.
+// Sharing app_state would send them to the document pane and corrupt its wrap cache.
+class agent_doc_events final : public document_events
+{
+public:
+	app_state& _app;
+
+	explicit agent_doc_events(app_state& app) : _app(app)
+	{
+	}
+
+	void invalidate(const uint32_t i) override { _app.invalidate(i); }
+
+	void invalidate_lines(const int start, const int end) override
+	{
+		if (_app._agent_view)
+			_app._agent_view->invalidate_lines(_app._agent_window, start, end);
+	}
+
+	void lines_changed(const int start, const int end) override
+	{
+		if (_app._agent_view)
+			_app._agent_view->lines_changed(_app._agent_window, start, end);
+
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	void line_count_changed(const int at, const int delta) override
+	{
+		if (_app._agent_view)
+			_app._agent_view->line_count_changed(_app._agent_window, at, delta);
+
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	void ensure_visible(const text_location&) override
+	{
+	}
+};
+
+// agent_input_doc_events — Routes the prompt document's events to the prompt window.
+// It is a document of its own so editing a prompt cannot touch either other pane's caches.
+class agent_input_doc_events final : public document_events
+{
+public:
+	app_state& _app;
+
+	explicit agent_input_doc_events(app_state& app) : _app(app)
+	{
+	}
+
+	void invalidate(uint32_t) override { _app.invalidate(invalid::agent_layout); }
+
+	void invalidate_lines(const int start, const int end) override
+	{
+		if (_app._agent_input_view)
+			_app._agent_input_view->invalidate_lines(_app._agent_input_window, start, end);
+	}
+
+	void lines_changed(const int start, const int end) override
+	{
+		if (_app._agent_input_view)
+			_app._agent_input_view->lines_changed(_app._agent_input_window, start, end);
+
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	void line_count_changed(const int at, const int delta) override
+	{
+		if (_app._agent_input_view)
+			_app._agent_input_view->line_count_changed(_app._agent_input_window, at, delta);
+
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	void ensure_visible(const text_location& pt) override
+	{
+		if (_app._agent_input_view)
+			_app._agent_input_view->ensure_visible(_app._agent_input_window, pt);
+	}
+};
 
 app_state::app_state(async_scheduler_ptr scheduler) : _doc_view(std::make_shared<edit_doc_view>(*this)),
                                                       _files_view(std::make_shared<file_list_view>(*this)),
                                                       _search_view(std::make_shared<search_list_view>(*this)),
+                                                      _agent_view(std::make_shared<agent_view>(*this)),
+                                                      _agent_input_view(std::make_shared<agent_input_view>(*this)),
                                                       _scheduler(std::move(scheduler))
 {
 	_active_item = std::make_shared<index_item>();
 	_active_item->doc = std::make_shared<document>(*this);
 	_root_folder = std::make_shared<index_item>();
 	_doc_view->set_document(active_item()->doc);
+
+	_agent_input_doc_events = std::make_shared<agent_input_doc_events>(*this);
+	_agent_input_doc = std::make_shared<document>(*_agent_input_doc_events);
+	_agent_input_view->set_document(_agent_input_doc);
+	_agent_input_view->on_submit = [this](std::string text) { on_agent_input(std::move(text)); };
+
+	_agent_view->on_answer = [this](const size_t index) { on_agent_answer(index); };
+	_agent_view->on_type = [this](const char32_t ch) { type_into_agent_input(ch); };
 	get_commands().set_commands(make_commands());
+}
+
+int app_state::agent_input_height() const
+{
+	return _agent_input_view ? _agent_input_view->desired_height() : 0;
+}
+
+bool app_state::agent_input_has_focus() const
+{
+	return _agent_input_window && _agent_input_view && _agent_visible && _agent_input_window->has_focus();
+}
+
+// A key pressed at the transcript was meant for the agent, so it lands in the prompt
+void app_state::type_into_agent_input(const char32_t ch)
+{
+	if (!_agent_input_view || !_agent_input_window)
+		return;
+
+	set_focus(view_focus::agent);
+	_agent_input_view->type(_agent_input_window, ch);
 }
 
 void app_state::ensure_visible(const text_location& pt)
@@ -510,23 +655,38 @@ void app_state::ensure_visible(const text_location& pt)
 void app_state::open_path_and_select(const index_item_ptr& item, const int line, const int col,
                                      const int length)
 {
-	load_doc(item, [this, item, line, col, length]
+	open_path_and_select(item, line, col, length, {});
+}
+
+void app_state::open_path_and_select(const index_item_ptr& item, const int line, const int col,
+                                     const int length, std::string message)
+{
+	load_doc(item, [this, item, line, col, length, message = std::move(message)]
 	{
 		const auto& d = item->doc;
-		if (!d || active_item() != item || line < 0 || line >= static_cast<int>(d->size()))
+		if (!d || active_item() != item || d->empty() || line < 0)
 			return;
 
-		const auto line_len = static_cast<int>((*d)[line].size());
-		const auto start = std::clamp(col, 0, line_len);
-		const auto end = std::clamp(col + length, start, line_len);
+		const auto row = std::min(line, static_cast<int>(d->size()) - 1);
+		std::string text;
+		(*d)[row].render(text);
+		const auto line_len = static_cast<int>(text.size());
+		auto start = std::clamp(col, 0, line_len);
+		auto end = start + std::clamp(length, 0, line_len - start);
+		if (start < line_len && pf::is_utf8_continuation(text[start]))
+			start = pf::utf8_prev(text, start);
+		if (end < line_len && pf::is_utf8_continuation(text[end]))
+			end = pf::utf8_prev(text, end);
 
 		// Scrolling to the match needs metrics for the document just loaded, not the one it replaced
 		_doc_view->layout();
 		_doc_view->recalc_vert_scrollbar();
 
-		d->select(text_selection(start, line, end, line));
-		ensure_visible(text_location(end, line)); // select() is a no-op when re-opening the same match
+		d->select(text_selection(start, row, end, row));
+		ensure_visible(text_location(end, row)); // select() is a no-op when re-opening the same match
 		invalidate(invalid::doc | invalid::doc_caret);
+		if (!message.empty())
+			set_message(message);
 	});
 }
 
@@ -571,7 +731,7 @@ void app_state::load_doc(const index_item_ptr& item, std::function<void()> on_lo
 
 		if (!changed_on_disk)
 		{
-			load_from_disk = false;
+			load_from_disk = disk_modified_time == 1 && !d->is_modified();
 		}
 		else if (d->is_modified())
 		{
@@ -751,6 +911,7 @@ void app_state::set_spell_check_mode(const spell_check_mode mode, const bool per
 {
 	_spell_check_mode = mode;
 	apply_spell_check_mode(doc());
+	apply_spell_check_mode(_agent_input_doc);
 	if (mode == spell_check_mode::disabled)
 		reset_spell_checker();
 	if (persist)
@@ -761,6 +922,12 @@ void app_state::set_focus(const view_focus v)
 {
 	if (v == view_focus::list)
 		_list_window->set_focus();
+	else if (v == view_focus::agent)
+	{
+		// The prompt is the agent pane's keyboard target; the transcript is read-only
+		if (_agent_input_window && _agent_visible)
+			_agent_input_window->set_focus();
+	}
 	else
 		_doc_window->set_focus();
 }
@@ -769,6 +936,8 @@ text_view_ptr app_state::focused_text_view() const
 {
 	if (_doc_window && _doc_window->has_focus())
 		return std::static_pointer_cast<text_view>(_doc_view);
+	if (agent_input_has_focus())
+		return std::static_pointer_cast<text_view>(_agent_input_view);
 	return {};
 }
 
@@ -797,6 +966,17 @@ bool app_state::can_edit_document() const
 {
 	return !inline_edit_has_focus() && is_edit_text(get_mode()) && _active_item && _active_item->doc &&
 		!_active_item->doc->is_read_only();
+}
+
+// Editing commands act on whatever has focus, so the agent prompt gets its own undo
+document_ptr app_state::focused_document() const
+{
+	return agent_input_has_focus() && _agent_input_doc ? _agent_input_doc : doc();
+}
+
+bool app_state::can_edit_focused_document() const
+{
+	return agent_input_has_focus() || can_edit_document();
 }
 
 list_view_item_ptr app_state::selected_file_list_item() const
@@ -910,6 +1090,7 @@ void app_state::update_styles()
 	_styles.list_font = {_styles.list_font_height, pf::font_name::calibri};
 	_styles.edit_font = {(_styles.list_font_height * 3) / 2, pf::font_name::calibri};
 	_styles.text_font = {_styles.text_font_height, pf::font_name::consolas};
+	_styles.agent_font = {_styles.agent_font_height, pf::font_name::consolas};
 
 	_styles.padding_x = static_cast<int>(5 * _styles.dpi_scale);
 	_styles.padding_y = static_cast<int>(5 * _styles.dpi_scale);
@@ -930,12 +1111,24 @@ void app_state::on_zoom(const int delta, const zoom_target target)
 	case zoom_target::list:
 		_styles.list_font_height = pf::clamp(_styles.list_font_height + delta, 8, 72);
 		break;
+	case zoom_target::agent:
+		_styles.agent_font_height = pf::clamp(_styles.agent_font_height + delta, 8, 72);
+		break;
 	}
 
 	update_styles();
 
 	_doc_window->notify_size();
 	_list_window->notify_size();
+
+	if (_agent_window)
+		_agent_window->notify_size();
+
+	if (_agent_input_window)
+	{
+		_agent_input_window->notify_size();
+		invalidate(invalid::agent_layout);
+	}
 }
 
 pf::file_path app_state::save_folder() const
@@ -1018,6 +1211,8 @@ void app_state::refresh_index(const pf::file_path& root_path, std::function<void
 				t->set_root(new_root);
 				t->note_content_changed();
 				t->remember_root_folder(t->root_item()->path);
+				t->discover_tools();
+				t->rebuild_cpp_index();
 				t->invalidate(invalid::files_layout | invalid::files_populate);
 
 				if (on_complete)
@@ -1401,33 +1596,40 @@ uint32_t app_state::handle_mouse(const pf::window_frame_ptr window,
 	_app_window = window;
 	using mt = pf::mouse_message_type;
 
+	const auto rect = window->get_client_rect();
+	const auto agent_rect = agent_splitter_bounds(rect);
+
 	if (msg == mt::left_button_down)
 	{
-		const auto rect = window->get_client_rect();
-		_panel_splitter.begin_tracking(rect, params.point, window);
+		if (!(_agent_visible && _agent_splitter.begin_tracking(agent_rect, params.point, window)))
+			_panel_splitter.begin_tracking(rect, params.point, window);
 	}
 
 	if (msg == mt::mouse_leave)
 	{
 		_panel_splitter.clear_hover(window);
+		_agent_splitter.clear_hover(window);
 	}
 
 	if (msg == mt::mouse_move)
 	{
-		const auto rect = window->get_client_rect();
-
 		if (params.left_button)
 		{
-			if (_panel_splitter.track_to(rect, params.point, window))
+			if (_panel_splitter.track_to(rect, params.point, window) ||
+				(_agent_visible && _agent_splitter.track_to(agent_rect, params.point, window)))
 				layout_views();
 		}
 
 		_panel_splitter.update_hover(rect, params.point, window);
+
+		if (_agent_visible)
+			_agent_splitter.update_hover(agent_rect, params.point, window);
 	}
 
 	if (msg == mt::left_button_up)
 	{
 		_panel_splitter.end_tracking(window);
+		_agent_splitter.end_tracking(window);
 	}
 
 	return 0;
@@ -1454,6 +1656,16 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 	_list_window->accept_drop_files(true);
 	_list_window->set_reactor(_files_view);
 
+	_agent_window = window->create_child("AGENT_FRAME",
+	                                     pf::window_style::child | pf::window_style::clip_children,
+	                                     ui::window_background);
+	_agent_window->set_reactor(_agent_view);
+
+	_agent_input_window = window->create_child("AGENT_INPUT_FRAME",
+	                                           pf::window_style::child | pf::window_style::clip_children,
+	                                           ui::window_background);
+	_agent_input_window->set_reactor(_agent_input_view);
+
 	// Restore font sizes from config
 	const auto text_size = pf::config_read("Font", "TextSize");
 	const auto list_size = pf::config_read("Font", "ListSize");
@@ -1476,12 +1688,24 @@ uint32_t app_state::on_create(const pf::window_frame_ptr& window)
 	if (double ratio = 0.0; parse_double_value(panel_ratio, ratio))
 		_panel_splitter._ratio = std::clamp(ratio, splitter::min_ratio, splitter::max_ratio);
 
+	if (double ratio = 0.0; parse_double_value(pf::config_read("Agent", "SplitterRatio"), ratio))
+		_agent_splitter._ratio = std::clamp(ratio, splitter::min_ratio, splitter::max_ratio);
+
+	if (int size = 0; parse_int_value(pf::config_read("Agent", "FontSize"), size))
+		_styles.agent_font_height = std::clamp(size, 8, 72);
+	else
+		_styles.agent_font_height = _styles.list_font_height;
+
+	update_styles();
+	show_agent_panel(pf::config_read("Agent", "Visible") == "1");
+
 	if (!word_wrap.empty())
 		_word_wrap = word_wrap != "0";
 	set_word_wrap(_word_wrap);
 
 	_spell_check_mode = parse_spell_check_mode(spell_check);
 	apply_spell_check_mode(doc());
+	apply_spell_check_mode(_agent_input_doc);
 
 	// Restore window placement from config
 	if (_has_startup_placement)
@@ -1515,6 +1739,20 @@ void app_state::handle_paint(pf::window_frame_ptr& window, pf::draw_context& dc)
 {
 	const auto bounds = window->get_client_rect();
 	_panel_splitter.draw(dc, bounds);
+
+	if (_agent_visible)
+		_agent_splitter.draw(dc, agent_splitter_bounds(bounds));
+}
+
+// The agent splitter divides only what is left of the document pane, so the two cannot cross.
+// With no room left it collapses against the right edge rather than leaving the window.
+pf::irect app_state::agent_splitter_bounds(const pf::irect& bounds) const
+{
+	auto rest = bounds;
+	const auto earliest = _panel_splitter.split_pos(bounds) + _panel_splitter.bar_width() + min_pane_width();
+	rest.left = std::min(earliest, bounds.right);
+	rest.right = std::max(rest.left, bounds.right);
+	return rest;
 }
 
 void app_state::layout_views() const
@@ -1528,6 +1766,27 @@ void app_state::layout_views() const
 
 	auto text_bounds = bounds;
 	text_bounds.left = panel_split + _panel_splitter.bar_width();
+
+	if (_agent_visible && _agent_window)
+	{
+		const auto agent_split = _agent_splitter.split_pos(agent_splitter_bounds(bounds));
+		text_bounds.right = std::max(text_bounds.left, agent_split - _agent_splitter.bar_width());
+
+		auto agent_bounds = bounds;
+		agent_bounds.left = std::min(agent_split + _agent_splitter.bar_width(), bounds.right);
+
+		// The prompt takes what it needs from the bottom; the transcript keeps the rest
+		auto input_bounds = agent_bounds;
+		input_bounds.top = std::clamp(agent_bounds.bottom - agent_input_height(),
+		                              agent_bounds.top, agent_bounds.bottom);
+		agent_bounds.bottom = input_bounds.top;
+
+		_agent_window->move_window(agent_bounds);
+
+		if (_agent_input_window)
+			_agent_input_window->move_window(input_bounds);
+	}
+
 	_doc_window->move_window(text_bounds);
 
 	auto panel_bounds = bounds;
@@ -1537,6 +1796,426 @@ void app_state::layout_views() const
 	{
 		_list_window->move_window(panel_bounds);
 	}
+}
+
+void app_state::show_agent_panel(const bool visible)
+{
+	_agent_visible = visible;
+
+	if (_agent_window)
+		_agent_window->show(visible);
+
+	if (_agent_input_window)
+		_agent_input_window->show(visible);
+
+	if (visible && _agent_view)
+		_agent_view->set_document(session_item()->doc);
+
+	layout_views();
+	invalidate(invalid::windows | invalid::agent_layout);
+}
+
+void app_state::toggle_agent_panel()
+{
+	show_agent_panel(!_agent_visible);
+
+	if (_agent_visible)
+		set_focus(view_focus::agent);
+	else
+		set_focus(view_focus::text);
+}
+
+void app_state::focus_agent_input()
+{
+	if (!_agent_visible)
+		show_agent_panel(true);
+
+	set_focus(view_focus::agent);
+}
+
+index_item_ptr app_state::session_item()
+{
+	if (!_agent_doc_events)
+		_agent_doc_events = std::make_shared<agent_doc_events>(*this);
+
+	// One transcript per root folder, so switching folders switches conversation
+	const auto folder = _root_folder ? _root_folder->path : pf::file_path{};
+	const auto path = folder.empty() ? pf::file_path{} : folder.combine(agent_session::file_name);
+
+	if (_session_item && _session_item->path == path)
+		return _session_item;
+
+	_session_item = std::make_shared<index_item>(path, std::string(agent_session::file_name), false);
+	_session_item->doc = std::make_shared<document>(*_agent_doc_events, load_session_text(path));
+	_session_item->doc->path(path);
+	apply_spell_check_mode(_session_item->doc);
+	_session_saved_time = pf::file_modified_time(path);
+	_session_listed = false;
+
+	if (_agent_view)
+		_agent_view->set_document(_session_item->doc);
+
+	return _session_item;
+}
+
+// Reads the transcript from disk, falling back to a fresh one. Auto-approval is never
+// resumed from a file, so a session that had it on comes back with it off.
+std::string app_state::load_session_text(const pf::file_path& path)
+{
+	std::string text;
+
+	if (read_file_text(path, text, max_agent_file_size) && !text.empty())
+	{
+		auto lines = agent_session::to_lines(text);
+
+		if (agent_session::read_options(lines, agent_session::parse(lines)).yolo)
+		{
+			agent_session::set_option(lines, "yolo", "off");
+			agent_session::append_entry(lines, agent_entry_kind::note, {},
+			                            "This session had YOLO on. It has been turned off — "
+			                            "use /yolo to turn it back on.");
+			text = agent_session::to_text(lines);
+		}
+
+		return text;
+	}
+
+	std::vector<std::string> lines;
+	agent_session::ensure_header(lines);
+	return agent_session::to_text(lines);
+}
+
+// The transcript is a file the user may edit, so a newer copy on disk wins
+void app_state::reload_session_if_changed()
+{
+	if (!_session_item)
+		return;
+
+	const auto modified = pf::file_modified_time(_session_item->path);
+
+	if (modified == 0 || modified == _session_saved_time)
+		return;
+
+	std::string text;
+
+	if (!read_file_text(_session_item->path, text, max_agent_file_size))
+		return;
+
+	const auto& doc = _session_item->doc;
+	{
+		undo_group ug(doc);
+		doc->replace_text(ug, doc->all(), text);
+	}
+
+	_session_saved_time = modified;
+	invalidate(invalid::agent_layout);
+
+	if (_agent_host)
+		_agent_host->adopt(agent_session::to_lines(doc->str()));
+}
+
+void app_state::save_session()
+{
+	// Without an open folder there is nowhere to put it, so the transcript stays in memory
+	if (!_session_item || !_session_item->doc || _session_item->path.empty())
+		return;
+
+	roll_over_long_session();
+
+	if (_session_item->doc->save_to_file(_session_item->path))
+	{
+		_session_saved_time = pf::file_modified_time(_session_item->path);
+
+		// The file may be new, so the folder browser needs to learn about it
+		if (!_session_listed)
+		{
+			_session_listed = true;
+			invalidate(invalid::index);
+		}
+	}
+}
+
+// A long conversation would eventually hit the document size cap, so the old part is
+// moved aside rather than silently lost
+void app_state::roll_over_long_session()
+{
+	const auto& doc = _session_item->doc;
+	auto text = doc->str();
+
+	if (text.size() <= max_session_bytes)
+		return;
+
+	const auto stamp = pf::file_modified_time(_session_item->path);
+	auto archive = _session_item->path.folder().combine(
+		std::format("session-{}", stamp == 0 ? 1 : stamp), "md");
+
+	// Never overwrite an archive, however often this runs
+	for (auto suffix = 2; archive.exists() && suffix < 100; ++suffix)
+		archive = _session_item->path.folder().combine(
+			std::format("session-{}-{}", stamp == 0 ? 1 : stamp, suffix), "md");
+
+	if (const auto file = pf::open_file_for_write(archive))
+	{
+		file->write(reinterpret_cast<const uint8_t*>(text.data()), static_cast<uint32_t>(text.size()));
+
+		std::vector<std::string> lines;
+		agent_session::ensure_header(lines);
+		agent_session::append_entry(lines, agent_entry_kind::note, {},
+		                            std::format("Earlier history moved to {}.", archive.name()));
+
+		undo_group ug(doc);
+		doc->replace_text(ug, doc->all(), agent_session::to_text(lines));
+
+		if (_agent_host)
+			_agent_host->adopt(agent_session::to_lines(doc->str()));
+
+		invalidate(invalid::index | invalid::agent_layout);
+	}
+}
+
+// Rewrites only the tail the agent touched, so a streamed token does not rebuild the document
+void app_state::apply_transcript_change(const int first, const std::span<const std::string> replacement)
+{
+	const auto& doc = session_item()->doc;
+	const auto line_count = static_cast<int>(doc->size());
+	const auto last = std::max(0, line_count - 1);
+	const auto last_len = line_count > 0 ? static_cast<int>((*doc)[last].size()) : 0;
+	const auto from = std::clamp(first, 0, line_count);
+
+	// Following the stream is only welcome when the newest line is already on screen.
+	// The scroll itself has to wait for the layout that agent_layout will run.
+	if (!_agent_view || _agent_view->at_bottom())
+		_agent_follow_tail = true;
+
+	auto text = agent_session::to_text(replacement);
+
+	const auto target = from >= line_count
+		                    ? text_selection(last_len, last, last_len, last)
+		                    : text_selection(0, from, last_len, last);
+
+	if (from >= line_count)
+		text.insert(text.begin(), '\n');
+
+	{
+		undo_group ug(doc);
+		doc->replace_text(ug, target, text);
+	}
+
+	invalidate(invalid::agent_layout);
+}
+
+// agent_sink — Connects the host's transcript edits, status and file access to the app
+class agent_sink final : public agent_host::events
+{
+public:
+	app_state& _app;
+
+	explicit agent_sink(app_state& app) : _app(app)
+	{
+	}
+
+	void transcript_changed(const int first, const std::span<const std::string> replacement) override
+	{
+		_app.apply_transcript_change(first, replacement);
+	}
+
+	void agent_status_changed(const std::string_view status) override
+	{
+		_app._agent_status = status;
+		_app.invalidate(invalid::agent_layout);
+	}
+
+	bool read_file(const pf::file_path& path, std::string& content, std::string& error) override
+	{
+		return _app.agent_read_file(path, content, error);
+	}
+
+	bool write_file(const pf::file_path& path, const std::string_view content, std::string& error) override
+	{
+		return _app.agent_write_file(path, content, error);
+	}
+
+	void transcript_settled() override { _app.save_session(); }
+};
+
+// The agent may only touch the folder that is open, checked after canonicalisation
+bool app_state::agent_path_allowed(const pf::file_path& path, std::string& error) const
+{
+	if (path.empty())
+	{
+		error = "no path was given";
+		return false;
+	}
+
+	const auto root = _root_folder ? _root_folder->path : pf::file_path{};
+
+	if (root.empty())
+	{
+		error = "no folder is open";
+		return false;
+	}
+
+	if (!pf::is_path_within(root, path))
+	{
+		error = std::format("'{}' is outside the open folder", path.view());
+		return false;
+	}
+
+	return true;
+}
+
+bool app_state::agent_read_file(const pf::file_path& path, std::string& content, std::string& error)
+{
+	if (!agent_path_allowed(path, error))
+		return false;
+
+	// An open document may hold unsaved work, which is what the agent should see
+	if (const auto item = find_item_recursively(_root_folder, path); item && item->doc)
+	{
+		content = item->doc->str();
+		return true;
+	}
+
+	if (!read_file_text(path, content, max_agent_file_size))
+	{
+		error = std::format("could not read '{}'", path.view());
+		return false;
+	}
+
+	return true;
+}
+
+bool app_state::agent_write_file(const pf::file_path& path, const std::string_view content, std::string& error)
+{
+	if (!agent_path_allowed(path, error))
+		return false;
+
+	// An open document takes the change through undo, so it can be reviewed and reversed
+	if (const auto item = find_item_recursively(_root_folder, path); item && item->doc)
+	{
+		const auto& doc = item->doc;
+
+		if (doc->is_read_only())
+		{
+			error = std::format("'{}' is read only", path.view());
+			return false;
+		}
+
+		{
+			undo_group ug(doc);
+			doc->replace_text(ug, doc->all(), content);
+		}
+
+		invalidate(invalid::doc | invalid::files_layout | invalid::app_title);
+		return true;
+	}
+
+	const auto file = pf::open_file_for_write(path);
+
+	if (!file)
+	{
+		error = std::format("could not write '{}'", path.view());
+		return false;
+	}
+
+	if (!content.empty())
+		file->write(reinterpret_cast<const uint8_t*>(content.data()), static_cast<uint32_t>(content.size()));
+
+	invalidate(invalid::index);
+	return true;
+}
+
+void app_state::ensure_agent_host()
+{
+	if (_agent_host)
+		return;
+
+	_agent_sink = std::make_shared<agent_sink>(*this);
+	_agent_host = std::make_unique<agent_host>(*_agent_sink);
+	_agent_host->on_clear = [this] { clear_agent_session(); };
+	_agent_host->gather_context = [this] { return agent_context(); };
+}
+
+// Only what the agent cannot discover for itself: which file is in front of the user, and where
+std::string app_state::agent_context() const
+{
+	const auto item = _active_item;
+
+	if (!item || !item->doc || item == _session_item)
+		return {};
+
+	const auto& doc = item->doc;
+	const auto root = _root_folder ? _root_folder->path.view() : std::string_view{};
+	auto shown = item->path.view();
+
+	if (!root.empty() && shown.size() > root.size() && pf::icmp(shown.substr(0, root.size()), root) == 0)
+	{
+		shown.remove_prefix(root.size());
+
+		while (!shown.empty() && (shown.front() == '\\' || shown.front() == '/'))
+			shown.remove_prefix(1);
+	}
+
+	const auto selection = doc->selection();
+	auto result = std::format("- open file: `{}`{}\n- caret: line {}\n", shown,
+	                          is_path_modified(item) ? " (unsaved changes)" : "",
+	                          selection._start.y + 1);
+
+	if (!doc->has_selection())
+		return result;
+
+	auto selected = doc->copy();
+
+	// A selection is a pointer to what matters, not a way to send the whole file
+	if (selected.size() > max_agent_selection_bytes)
+	{
+		const auto cut = selected.rfind('\n', max_agent_selection_bytes);
+		selected.erase(cut == std::string::npos ? max_agent_selection_bytes : cut);
+		selected += "\n[selection truncated]";
+	}
+
+	result += std::format("- selected lines {}-{}:\n\n```\n{}\n```\n", selection._start.y + 1,
+	                      selection._end.y + 1, selected);
+
+	return result;
+}
+
+void app_state::on_agent_input(std::string text)
+{
+	ensure_agent_host();
+	reload_session_if_changed();
+	// Only the visible record; a new agent session is given it as history, a live one already has it
+	_agent_host->adopt(agent_session::to_lines(session_item()->doc->str()));
+	// After adopting, so anything this writes lands on the lines the document actually holds
+	_agent_host->set_working_dir(_root_folder ? _root_folder->path : pf::current_directory());
+	_agent_follow_tail = true; // whatever you just sent should be the thing you can see
+	_agent_host->submit(text);
+}
+
+void app_state::on_agent_answer(const size_t index)
+{
+	if (_agent_host)
+		_agent_host->answer(index);
+}
+
+void app_state::clear_agent_session()
+{
+	const auto item = session_item();
+
+	std::vector<std::string> lines;
+	agent_session::ensure_header(lines);
+
+	// Cleared in place rather than replaced, so Ctrl+Z brings the conversation back
+	{
+		undo_group ug(item->doc);
+		item->doc->replace_text(ug, item->doc->all(), agent_session::to_text(lines));
+	}
+
+	if (_agent_host)
+		_agent_host->adopt(lines);
+
+	save_session();
+	invalidate(invalid::agent_layout);
 }
 
 void app_state::save_config() const
@@ -1559,6 +2238,9 @@ void app_state::save_config() const
 
 	// Save splitter positions as ratios
 	pf::config_write("Splitter", "PanelRatio", to_str(_panel_splitter._ratio));
+	pf::config_write("Agent", "SplitterRatio", to_str(_agent_splitter._ratio));
+	pf::config_write("Agent", "FontSize", to_str(_styles.agent_font_height));
+	pf::config_write("Agent", "Visible", _agent_visible ? "1" : "0");
 	pf::config_write("View", "WordWrap", _word_wrap ? "1" : "0");
 	pf::config_write("View", "SpellCheck", spell_check_mode_config_value(_spell_check_mode));
 
@@ -1656,6 +2338,640 @@ void app_state::update_recent_root_menu()
 {
 	if (_app_window)
 		_app_window->set_menu(build_menu());
+}
+
+//
+// Project tools
+//
+
+bool app_state::tools_busy() const
+{
+	return _tools && _tools->busy();
+}
+
+void app_state::discover_tools()
+{
+	const auto root = root_item();
+	const auto script = root && !root->path.empty() ? root->path.combine("dd.ps1") : pf::file_path{};
+
+	// Already read this one, so a plain folder refresh costs nothing
+	if (!script.empty() && script == _script_path && !_script.empty())
+		return;
+
+	_script = {};
+	_script_path = {};
+
+	if (script.empty() || !script.exists())
+		return;
+
+	if (_powershell.empty())
+	{
+		_powershell = pf::find_executable("pwsh");
+
+		if (_powershell.empty())
+			_powershell = pf::find_executable("powershell");
+	}
+
+	if (_powershell.empty())
+		return;
+
+	_script_path = script;
+	run_tool(tools::probe_script_command(_powershell, script));
+}
+
+void app_state::run_tool(tools::command cmd)
+{
+	if (!_tools)
+	{
+		_tools = std::make_unique<tools::runner>();
+		_tools->on_started = [this](const tools::command& started)
+		{
+			if (started.tag != "probe")
+				set_message(std::format("{}...", started.name));
+		};
+		_tools->on_output = [this](const std::string_view line)
+		{
+			if (_tools->current_requester() == tools::requester::user && !line.empty())
+				set_message(std::string(line));
+		};
+		_tools->on_finished = [this](const tools::result& result) { on_tool_finished(result); };
+	}
+
+	if (cmd.destructive)
+	{
+		const auto id = _app_window->message_box(std::format("Run '{}'?", cmd.name), g_app_name,
+		                                         pf::msg_box_style::yes_no | pf::msg_box_style::icon_question);
+
+		if (id != pf::msg_box_result::yes)
+			return;
+	}
+
+	// Save / discard / cancel, so a build never silently compiles stale text
+	if (cmd.tag != "probe" && !prompt_save_all_modified())
+		return;
+
+	if (_tools->queue(std::move(cmd)) == 0)
+		set_message("Too many tools are already waiting to run.");
+}
+
+void app_state::on_tool_finished(const tools::result& result)
+{
+	if (result.tag == "probe")
+	{
+		std::string reply;
+
+		for (const auto& line : result.output)
+			reply += line.text;
+
+		_script = tools::parse_script_interface(reply);
+		update_recent_root_menu();
+		return;
+	}
+
+	const auto errors = std::ranges::count(result.diagnostics, tools::severity::error, &tools::diagnostic::level);
+	const auto warnings = std::ranges::count(result.diagnostics, tools::severity::warning,
+	                                         &tools::diagnostic::level);
+
+	if (!result.started)
+		set_message(std::format("'{}' could not be started.", result.name));
+	else if (result.cancelled)
+		set_message(std::format("'{}' was stopped.", result.name));
+	else
+		set_message(std::format("'{}' finished with exit code {} — {} errors, {} warnings.",
+		                        result.name, result.exit_code, errors, warnings));
+
+	_diagnostics = result.diagnostics;
+	_diagnostics_root = pf::file_path{result.working_dir};
+	_diagnostic_index = -1;
+
+	show_generated_document(save_folder().combine("tool-output", "md"), tools::to_markdown(result));
+}
+
+int app_state::step_diagnostic_index(const int count, const int current, const int delta)
+{
+	if (count <= 0)
+		return -1;
+
+	if (current < 0)
+		return delta >= 0 ? 0 : count - 1;
+
+	return ((current + delta) % count + count) % count;
+}
+
+pf::file_path app_state::resolve_diagnostic_path(const pf::file_path& root, const std::string_view file)
+{
+	if (file.empty())
+		return {};
+
+	const auto absolute = (file.size() > 2 && file[1] == ':') || file.starts_with("\\\\") || file.starts_with("//");
+
+	if (absolute)
+		return pf::file_path{file};
+
+	return root.empty() ? pf::file_path{} : root.combine(file);
+}
+
+void app_state::go_to_diagnostic(const int delta)
+{
+	if (_diagnostics.empty())
+	{
+		set_message("No diagnostics. Run a build first.");
+		return;
+	}
+
+	_diagnostic_index = step_diagnostic_index(static_cast<int>(_diagnostics.size()), _diagnostic_index, delta);
+	const auto& d = _diagnostics[_diagnostic_index];
+
+	set_message(std::format("{}/{}: {}{}", _diagnostic_index + 1, _diagnostics.size(),
+	                        d.code.empty() ? std::string{} : d.code + " ", d.text));
+
+	// A linker error names an object file and no line, so there is nowhere to go
+	if (d.line <= 0)
+		return;
+
+	const auto path = resolve_diagnostic_path(_diagnostics_root, d.file);
+
+	if (path.empty() || !path.exists())
+		return;
+
+	const auto line = d.line - 1;
+	const auto column = std::max(d.column - 1, 0);
+
+	if (const auto item = find_item_recursively(root_item(), path))
+		open_path_and_select(item, line, column, 0);
+	else
+		load_doc(path);
+}
+
+//
+// C++ navigation
+//
+
+bool app_state::is_indexable_source(const std::string_view path)
+{
+	static const std::set<std::string_view, pf::iless> extensions = {
+		".h", ".hpp", ".hh", ".hxx", ".inl", ".c", ".cpp", ".cc", ".cxx", ".ixx",
+	};
+
+	const auto dot = path.find_last_of("./\\");
+	return dot != std::string_view::npos && path[dot] == '.' && extensions.contains(path.substr(dot));
+}
+
+static void collect_source_paths(const index_item_ptr& item, std::vector<pf::file_path>& out)
+{
+	if (!item)
+		return;
+
+	if (!item->is_folder && !item->is_deleted && app_state::is_indexable_source(item->path.view()))
+		out.push_back(item->path);
+
+	for (const auto& child : item->children)
+		collect_source_paths(child, out);
+}
+
+void app_state::rebuild_cpp_index()
+{
+	const auto generation = ++_cpp_index_generation;
+	std::vector<pf::file_path> paths;
+	collect_source_paths(root_item(), paths);
+
+	if (paths.empty())
+	{
+		_cpp_index.reset();
+		return;
+	}
+
+	_scheduler->run_async([t = shared_from_this(), generation, paths = std::move(paths)]
+	{
+		auto built = std::make_shared<cpp::index>();
+
+		for (const auto& path : paths)
+		{
+			const auto handle = pf::open_for_read(path);
+			if (!handle || handle->size() > max_indexed_source_size)
+				continue;
+
+			std::string source;
+			iterate_file_lines(handle, [&source](const std::string& line, int)
+			{
+				source += line;
+				source += '\n';
+			});
+
+			if (source.size() <= max_indexed_source_size)
+				built->update_file(built->add_file(path.view()), source);
+		}
+
+		t->_scheduler->run_ui([t, built, generation]
+		{
+			if (generation != t->_cpp_index_generation)
+				return;
+			t->_cpp_index = built;
+			t->_goto_word.clear();
+			t->reindex_open_documents();
+		});
+	});
+}
+
+void app_state::reindex_open_documents()
+{
+	if (!_cpp_index)
+		return;
+
+	const auto update = [&](const auto& self, const index_item_ptr& item) -> void
+	{
+		if (!item || item->is_deleted)
+			return;
+		if (!item->is_folder && item->doc && !item->doc->is_truncated() &&
+			(item->doc->disk_modified_time() != 1 || item->doc->is_modified()) &&
+			is_indexable_source(item->path.view()))
+		{
+			const auto source = item->doc->str();
+			if (source.size() <= max_indexed_source_size)
+				_cpp_index->update_file(_cpp_index->add_file(item->path.view()), source);
+		}
+		for (const auto& child : item->children)
+			self(self, child);
+	};
+	update(update, root_item());
+}
+
+bool app_state::can_navigate_cpp() const
+{
+	return _doc_window && _doc_window->has_focus() && is_edit_text(get_mode()) &&
+		_active_item && !_active_item->is_folder && !_active_item->is_deleted && doc() &&
+		doc()->encoding() != file_encoding::binary && is_indexable_source(_active_item->path.view());
+}
+
+std::string app_state::word_at_caret() const
+{
+	const auto d = doc();
+
+	if (!d || d->size() == 0)
+		return {};
+
+	const auto pos = d->cursor_pos();
+
+	if (pos.y < 0 || pos.y >= static_cast<int>(d->size()))
+		return {};
+
+	const auto sel = d->word_selection(pos, false);
+
+	if (sel._start.y != sel._end.y || sel._end.x <= sel._start.x)
+		return {};
+
+	std::string line;
+	(*d)[pos.y].render(line);
+
+	if (sel._end.x > static_cast<int>(line.size()))
+		return {};
+
+	auto word = line.substr(sel._start.x, static_cast<size_t>(sel._end.x - sel._start.x));
+	const auto first = static_cast<unsigned char>(word.empty() ? 0 : word.front());
+
+	// Punctuation and whitespace are words to the editor but not to the index
+	if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_' || first >= 0x80))
+		return {};
+
+	return word;
+}
+
+std::vector<cpp::symbol> app_state::rank_candidates(std::vector<cpp::symbol> found,
+                                                  const pf::file_path& preferred_file) const
+{
+	const auto item = active_item();
+	const auto path = preferred_file.empty() && item ? item->path : preferred_file;
+	const auto current_file = _cpp_index ? _cpp_index->find_file(path.view()) : 0;
+
+	const auto score = [&](const cpp::symbol& s)
+	{
+		auto value = 0;
+
+		if ((s.flags & cpp::symbol_flag::definition) != 0)
+			value += 8;
+
+		if (current_file != 0 && s.file == current_file)
+			value += 4;
+
+		if ((s.flags & cpp::symbol_flag::alternative_branch) != 0)
+			value -= 2;
+
+		// A type or a namespace is a more useful destination than a local variable
+		if (s.kind == cpp::symbol_kind::variable)
+			value -= 1;
+
+		return value;
+	};
+
+	std::ranges::stable_sort(found, [&](const cpp::symbol& a, const cpp::symbol& b)
+	{
+		if (score(a) != score(b))
+			return score(a) > score(b);
+		const auto order = pf::icmp(_cpp_index->file_path(a.file), _cpp_index->file_path(b.file));
+		if (order != 0)
+			return order < 0;
+		if (a.line != b.line)
+			return a.line < b.line;
+		return a.column < b.column;
+	});
+
+	return found;
+}
+
+std::string app_state::describe_symbol(const cpp::symbol& s) const
+{
+	const auto path = pf::file_path{_cpp_index->file_path(s.file)};
+	return std::format("{} {} — {}({})", cpp::to_string(s.kind), _cpp_index->qualified_name(s),
+	                   path.name(), s.line + 1);
+}
+
+void app_state::go_to_definition()
+{
+	if (!can_navigate_cpp())
+		return;
+
+	if (!_cpp_index)
+	{
+		set_message("No C++ index for this folder yet.");
+		return;
+	}
+
+	const auto word = word_at_caret();
+
+	if (word.empty())
+	{
+		set_message("Put the caret on a name first.");
+		return;
+	}
+
+	const auto pos = doc()->cursor_pos();
+	const bool continuing = word == _goto_word && active_item()->path == _goto_destination.path &&
+		pos == text_location{_goto_destination.column, _goto_destination.line};
+	if (!continuing)
+	{
+		_goto_origin = active_item()->path;
+		_goto_next = 0;
+	}
+	reindex_open_documents();
+	const auto found = rank_candidates(_cpp_index->find(word), _goto_origin);
+
+	if (found.empty())
+	{
+		set_message(std::format("No declaration of '{}' in this folder.", word));
+		return;
+	}
+
+	_goto_word = word;
+	const auto which = _goto_next % found.size();
+	_goto_next = which + 1;
+	const auto& target = found[which];
+	_goto_destination = {pf::file_path{_cpp_index->file_path(target.file)},
+		static_cast<int>(target.line), static_cast<int>(target.column + _cpp_index->name_of(target).size())};
+
+	record_location();
+	auto message = found.size() > 1
+		? std::format("{} of {}: {} — press again for the next", which + 1, found.size(),
+		              describe_symbol(found[which]))
+		: describe_symbol(found[which]);
+	go_to_symbol(found[which], std::move(message));
+}
+
+void app_state::go_to_symbol(const cpp::symbol& s, std::string message)
+{
+	const auto path = pf::file_path{_cpp_index->file_path(s.file)};
+
+	if (path.empty())
+		return;
+
+	const auto length = static_cast<int>(_cpp_index->name_of(s).size());
+
+	if (const auto item = find_item_recursively(root_item(), path))
+		open_path_and_select(item, static_cast<int>(s.line), static_cast<int>(s.column), length, std::move(message));
+	else if (path.exists())
+		load_doc(path);
+}
+
+std::vector<std::string> app_state::counterpart_names(const std::string_view name)
+{
+	const auto dot = name.find_last_of('.');
+
+	if (dot == std::string_view::npos || !is_indexable_source(name))
+		return {};
+
+	const auto stem = std::string(name.substr(0, dot));
+	const auto extension = name.substr(dot);
+
+	static const std::set<std::string_view, pf::iless> headers = {".h", ".hpp", ".hh", ".hxx"};
+	static constexpr std::string_view source_extensions[] = {".cpp", ".cc", ".cxx", ".c", ".inl", ".ixx"};
+	static constexpr std::string_view header_extensions[] = {".h", ".hpp", ".hh", ".hxx"};
+
+	const auto wanted = headers.contains(extension)
+		                    ? std::span<const std::string_view>(source_extensions)
+		                    : std::span<const std::string_view>(header_extensions);
+
+	std::vector<std::string> out;
+
+	for (const auto candidate : wanted)
+		out.push_back(stem + std::string(candidate));
+
+	return out;
+}
+
+static index_item_ptr find_item_by_name(const index_item_ptr& item, const std::string_view name)
+{
+	if (!item)
+		return {};
+
+	if (!item->is_folder && !item->is_deleted && pf::icmp(item->name, name) == 0)
+		return item;
+
+	for (const auto& child : item->children)
+		if (auto found = find_item_by_name(child, name))
+			return found;
+
+	return {};
+}
+
+void app_state::switch_header_source()
+{
+	if (!can_navigate_cpp())
+		return;
+
+	const auto item = active_item();
+
+	if (!item || item->path.empty())
+		return;
+
+	for (const auto& name : counterpart_names(item->path.name()))
+	{
+		// The sibling first, since that is nearly always the right one
+		if (const auto sibling = find_item_recursively(root_item(), item->path.folder().combine(name));
+			sibling && !sibling->is_folder && !sibling->is_deleted)
+		{
+			record_location();
+			load_doc(sibling);
+			return;
+		}
+	}
+
+	for (const auto& name : counterpart_names(item->path.name()))
+	{
+		if (const auto elsewhere = find_item_by_name(root_item(), name))
+		{
+			record_location();
+			load_doc(elsewhere);
+			return;
+		}
+	}
+
+	set_message(std::format("No counterpart for '{}'.", item->path.name()));
+}
+
+void app_state::record_location()
+{
+	const auto item = active_item();
+
+	if (!item || item->path.empty())
+		return;
+
+	const auto pos = doc() ? doc()->cursor_pos() : text_location{};
+	_back.push_back({item->path, pos.y, pos.x});
+	_forward.clear();
+
+	if (_back.size() > max_history)
+		_back.erase(_back.begin());
+}
+
+void app_state::go_back()
+{
+	while (!_back.empty())
+	{
+		const auto item = find_item_recursively(root_item(), _back.back().path);
+		if (item && !item->is_deleted && !item->is_folder)
+			break;
+		_back.pop_back();
+	}
+	if (_back.empty())
+	{
+		set_message("Nowhere to go back to.");
+		return;
+	}
+
+	if (const auto item = active_item(); item && !item->path.empty())
+	{
+		const auto pos = doc() ? doc()->cursor_pos() : text_location{};
+		_forward.push_back({item->path, pos.y, pos.x});
+	}
+
+	const auto entry = _back.back();
+	_back.pop_back();
+
+	if (const auto item = find_item_recursively(root_item(), entry.path))
+	{
+		set_focus(view_focus::text);
+		open_path_and_select(item, entry.line, entry.column, 0);
+	}
+}
+
+void app_state::go_forward()
+{
+	while (!_forward.empty())
+	{
+		const auto item = find_item_recursively(root_item(), _forward.back().path);
+		if (item && !item->is_deleted && !item->is_folder)
+			break;
+		_forward.pop_back();
+	}
+	if (_forward.empty())
+	{
+		set_message("Nowhere to go forward to.");
+		return;
+	}
+
+	if (const auto item = active_item(); item && !item->path.empty())
+	{
+		const auto pos = doc() ? doc()->cursor_pos() : text_location{};
+		_back.push_back({item->path, pos.y, pos.x});
+	}
+
+	const auto entry = _forward.back();
+	_forward.pop_back();
+
+	if (const auto item = find_item_recursively(root_item(), entry.path))
+	{
+		set_focus(view_focus::text);
+		open_path_and_select(item, entry.line, entry.column, 0);
+	}
+}
+
+std::vector<pf::menu_command> app_state::build_tools_menu()
+{
+	using cid = command_id;
+
+	std::vector<pf::menu_command> items;
+	auto next_id = tool_menu_id_base;
+
+	if (_script_path.empty())
+	{
+		items.emplace_back("(No dd.ps1 in this folder)", 0, nullptr, [] { return false; });
+	}
+	else
+	{
+		for (const auto& name : _script.commands)
+		{
+			const auto destructive = name == "clean";
+
+			items.emplace_back(
+				escape_menu_text(name), next_id++,
+				[this, name, destructive]
+				{
+					std::vector<tools::script_argument> arguments;
+
+					for (const auto& option : _script.options)
+						if (const auto chosen = _script_choices.find(option.name);
+							chosen != _script_choices.end())
+							arguments.push_back({option.name, chosen->second});
+
+					auto cmd = tools::script_command(_powershell, _script_path, name, arguments,
+					                                 _script_path.folder());
+					cmd.destructive = destructive;
+					run_tool(std::move(cmd));
+				},
+				[this] { return !tools_busy(); });
+		}
+
+		if (items.empty())
+			items.emplace_back("(dd.ps1 offers no commands)", 0, nullptr, [] { return false; });
+
+		for (const auto& option : _script.options)
+		{
+			std::vector<pf::menu_command> values;
+
+			for (const auto& value : option.values)
+			{
+				values.emplace_back(
+					escape_menu_text(value), next_id++,
+					[this, name = option.name, value] { _script_choices[name] = value; },
+					[this] { return !tools_busy(); },
+					[this, name = option.name, value, first = option.values.front()]
+					{
+						const auto chosen = _script_choices.find(name);
+						return chosen == _script_choices.end() ? value == first : chosen->second == value;
+					});
+			}
+
+			items.emplace_back(pf::menu_command{});
+			items.emplace_back(escape_menu_text(option.name), 0, nullptr, nullptr, nullptr, std::move(values));
+		}
+	}
+
+	items.emplace_back(pf::menu_command{});
+	items.emplace_back(command_menu_item(cid::tools_next_diagnostic));
+	items.emplace_back(command_menu_item(cid::tools_prev_diagnostic));
+	items.emplace_back(pf::menu_command{});
+	items.emplace_back(command_menu_item(cid::tools_stop));
+	items.emplace_back(command_menu_item(cid::tools_refresh));
+	return items;
 }
 
 std::vector<pf::menu_command> app_state::build_recent_root_folder_menu()
@@ -1822,10 +3138,56 @@ void app_state::on_idle()
 		_list_window->invalidate();
 	}
 
+	if (invalids & invalid::agent_layout)
+	{
+		if (_agent_view && _agent_window && _agent_visible)
+		{
+			// The prompt is measured before the transcript, because its height takes the room
+			if (_agent_input_view && _agent_input_window)
+			{
+				_agent_input_window->notify_size();
+
+				// The first real font measurement changes this too, not just typing another row
+				if (const auto height = _agent_input_view->desired_height(); height != _agent_input_height)
+				{
+					_agent_input_height = height;
+					layout_views();
+				}
+
+				_agent_input_view->recalc_vert_scrollbar();
+				_agent_input_view->update_caret(_agent_input_window);
+				_agent_input_window->invalidate();
+			}
+
+			// Sized first: the layout and the scrollbar both need the current extent
+			_agent_window->notify_size();
+			_agent_view->layout();
+			_agent_view->recalc_vert_scrollbar();
+
+			// Only now does the view know how tall the new content is
+			if (std::exchange(_agent_follow_tail, false))
+			{
+				_agent_view->scroll_to_end();
+				_agent_view->recalc_vert_scrollbar();
+			}
+
+			_agent_window->invalidate();
+		}
+	}
+
 	if (invalids & invalid::windows)
 	{
 		_doc_window->invalidate();
 		_list_window->invalidate();
+
+		// Scrolling the transcript raises this bit, so the agent pane has to follow it
+		if (_agent_window && _agent_visible)
+		{
+			_agent_window->invalidate();
+
+			if (_agent_input_window)
+				_agent_input_window->invalidate();
+		}
 	}
 }
 
@@ -1880,6 +3242,195 @@ namespace
 		return out;
 	}
 
+	void print_acp_update(const json::value& params)
+	{
+		const auto& update = params["update"];
+		const auto kind = update["sessionUpdate"].text();
+
+		if (kind == "agent_message_chunk")
+			pf::write_stdout(update["content"]["text"].text());
+		else if (kind == "agent_thought_chunk")
+			pf::write_stdout(std::format("\n[thinking] {}\n", update["content"]["text"].text()));
+		else if (kind == "tool_call")
+			pf::write_stdout(std::format("\n[tool] {}\n", update["title"].text(update["kind"].text())));
+		else if (kind == "plan")
+			pf::write_stdout(std::format("\n[plan] {} entries\n", update["entries"].size()));
+		else if (kind == "available_commands_update")
+			pf::write_stdout(std::format("\n[commands] {} available\n", update["availableCommands"].size()));
+	}
+
+	// Verifies the agent can be found, started and spoken to. Never approves a tool call.
+	int run_acp_diagnostics(const std::string_view prompt)
+	{
+		const auto exe = pf::find_executable("copilot");
+
+		if (exe.empty())
+		{
+			pf::write_stdout("copilot was not found on PATH. Install it with 'winget install GitHub.Copilot'.\n");
+			return 1;
+		}
+
+		pf::write_stdout(std::format("Executable: {}\n", exe.view()));
+
+		const auto working_dir = pf::current_directory();
+		child_transport wire;
+		acp::client client(wire);
+
+		auto finished = false;
+		auto exit_code = 0;
+
+		client.on_error = [&](const std::string_view message)
+		{
+			pf::write_stdout(std::format("\nError: {}\n", message));
+			finished = true;
+			exit_code = 1;
+		};
+
+		client.on_ready = [&]
+		{
+			pf::write_stdout(std::format("Session: {}\n", client.session_id()));
+
+			if (prompt.empty())
+				finished = true;
+			else if (!client.send_prompt(prompt))
+				finished = true;
+		};
+
+		client.on_session_update = [](const json::value& params) { print_acp_update(params); };
+
+		client.on_turn_end = [&](const acp::stop_reason reason)
+		{
+			pf::write_stdout(std::format("\nStopped: {}\n", acp::to_string(reason)));
+			finished = true;
+		};
+
+		client.on_permission_request = [&](const acp::request_id id, const json::value& params)
+		{
+			pf::write_stdout(std::format("\n[permission refused] {}\n", params["toolCall"]["title"].text()));
+			client.respond(id, json::object().set("outcome", json::object().set("outcome", "cancelled")));
+		};
+
+		pf::child_process_callbacks callbacks;
+		callbacks.on_stdout_line = [&client](const std::string_view line) { client.on_line(line); };
+		callbacks.on_stderr_line = [](const std::string_view line)
+		{
+			pf::write_stdout(std::format("[stderr] {}\n", line));
+		};
+		callbacks.on_exit = [&](const int code)
+		{
+			client.on_disconnect(std::format("the agent exited with code {}", code));
+			finished = true;
+		};
+
+		const std::string args[] = {"--acp", "--stdio"};
+		const auto process = pf::spawn_child_process(exe, args, working_dir, std::move(callbacks));
+
+		if (!process)
+		{
+			pf::write_stdout("Could not start the agent.\n");
+			return 1;
+		}
+
+		wire.process = process.get();
+		client.start(working_dir.view());
+
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+
+		while (!finished && std::chrono::steady_clock::now() < deadline)
+			pf::pump_ui_tasks(100);
+
+		if (!finished)
+		{
+			pf::write_stdout("\nTimed out waiting for the agent.\n");
+			exit_code = 1;
+		}
+
+		return exit_code;
+	}
+
+	// Drives the real agent_host, so the path the panel uses is exercised without a window
+	int run_agent_diagnostics(const std::string_view prompt)
+	{
+		struct console_sink final : agent_host::events
+		{
+			std::vector<std::string> lines;
+
+			void transcript_changed(const int first, const std::span<const std::string> replacement) override
+			{
+				lines.resize(static_cast<size_t>(std::clamp(first, 0, static_cast<int>(lines.size()))));
+
+				for (const auto& line : replacement)
+					lines.push_back(line);
+			}
+
+			void agent_status_changed(const std::string_view status) override
+			{
+				pf::write_stdout(std::format("[{}]\n", status));
+			}
+
+			bool read_file(const pf::file_path& path, std::string&, std::string& error) override
+			{
+				error = "reads are not offered by this diagnostic";
+				pf::write_stdout(std::format("[refused read] {}\n", path.view()));
+				return false;
+			}
+
+			bool write_file(const pf::file_path& path, std::string_view, std::string& error) override
+			{
+				error = "writes are not offered by this diagnostic";
+				pf::write_stdout(std::format("[refused write] {}\n", path.view()));
+				return false;
+			}
+
+			void transcript_settled() override
+			{
+			}
+		};
+
+		console_sink sink;
+		agent_host host(sink);
+
+		host.set_working_dir(pf::current_directory());
+		host.submit(prompt);
+
+		const auto start = std::chrono::steady_clock::now();
+		auto saw_work = false;
+
+		// The turn is over once the host has been busy and has stopped again
+		for (;;)
+		{
+			pf::pump_ui_tasks(100);
+
+			// Nothing here can answer a question, so stop rather than wait out the timeout
+			if (host.awaiting_answer())
+				break;
+
+			if (host.busy())
+			{
+				saw_work = true;
+			}
+			else if (saw_work)
+			{
+				break;
+			}
+
+			const auto elapsed = std::chrono::steady_clock::now() - start;
+
+			if (!saw_work && !host.connected() && elapsed > std::chrono::seconds(45))
+				break;
+
+			if (elapsed > std::chrono::seconds(180))
+				break;
+		}
+
+		pf::write_stdout("\n----- transcript -----\n");
+		pf::write_stdout(agent_session::to_text(sink.lines));
+		pf::write_stdout("\n");
+
+		host.shutdown();
+		return saw_work ? 0 : 1;
+	}
+
 	// Handles the non-GUI command-line modes; also reports any file argument to open.
 	cli_mode_result run_cli_mode(const std::span<const std::string_view> params, std::string_view& file_to_open)
 	{
@@ -1891,6 +3442,9 @@ namespace
 				pf::write_stdout(results.output);
 				return {true, {.start_gui = false, .exit_code = results.fail_count == 0 ? 0 : 1}};
 			}
+
+			if (pf::icmp(param, "/acp") == 0 || pf::icmp(param, "--acp") == 0)
+				return {true, {.start_gui = false, .exit_code = run_acp_diagnostics({})}};
 
 			auto try_prefix = [&](const std::string_view p1, const std::string_view p2) -> std::string_view
 			{
@@ -1906,6 +3460,12 @@ namespace
 				pf::write_stdout(spell_check_diagnostics(word));
 				return {true, {.start_gui = false}};
 			}
+
+			if (const auto text = try_prefix("/acp:", "--acp:"); !text.empty())
+				return {true, {.start_gui = false, .exit_code = run_acp_diagnostics(text)}};
+
+			if (const auto text = try_prefix("/agent:", "--agent:"); !text.empty())
+				return {true, {.start_gui = false, .exit_code = run_agent_diagnostics(text)}};
 
 			if (!param.starts_with(u8'/') && !param.starts_with(u8'-'))
 			{

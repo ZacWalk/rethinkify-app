@@ -401,9 +401,12 @@ public:
 
 		// A width change invalidates every break point
 		mark_wrap_dirty_all();
+		layout();
 
-		if (_word_wrap)
-			layout();
+		// invalid::doc_scrollbar names the document pane, so a view in its own window
+		// would never see its own scrollbar brought up to date
+		if (_doc)
+			recalc_vert_scrollbar();
 
 		_events.invalidate(invalid::doc_scrollbar | invalid::doc_layout);
 	}
@@ -919,6 +922,7 @@ protected:
 
 	uint32_t on_right_button_down(pf::window_frame_ptr& window, const pf::ipoint& point)
 	{
+		window->set_focus();
 		if (!allows_drag_selection())
 			return 0;
 
@@ -1133,10 +1137,19 @@ protected:
 
 	void on_context_menu(const pf::window_frame_ptr& window, const pf::ipoint& screen_pt)
 	{
-		const auto client_pt = window->screen_to_client(screen_pt);
+		window->set_focus();
+		const bool from_keyboard = screen_pt.x == -1 && screen_pt.y == -1;
+		const auto client_pt = from_keyboard
+			? text_to_client(_doc->cursor_pos()) : window->screen_to_client(screen_pt);
+		auto popup_pt = screen_pt;
+		if (from_keyboard)
+		{
+			const auto origin = window->screen_to_client({});
+			popup_pt = {client_pt.x - origin.x, client_pt.y - origin.y};
+		}
 		const auto items = on_popup_menu(client_pt);
 		if (!items.empty())
-			window->show_popup_menu(items, screen_pt);
+			window->show_popup_menu(items, popup_pt);
 	}
 
 	virtual std::vector<pf::menu_command> on_popup_menu(const pf::ipoint& client_pt)
@@ -1677,12 +1690,12 @@ private:
 	}
 
 protected:
-	[[nodiscard]] int top_content_padding() const
+	[[nodiscard]] virtual int top_content_padding() const
 	{
 		return _font_extent.cy > 0 ? std::max(1, _font_extent.cy / 2) : 0;
 	}
 
-	[[nodiscard]] int bottom_content_padding() const
+	[[nodiscard]] virtual int bottom_content_padding() const
 	{
 		return _font_extent.cy > 0 ? _font_extent.cy : 0;
 	}
@@ -2052,9 +2065,9 @@ protected:
 
 			if (y + nLineHeight > clip.top && y < clip.bottom)
 			{
-				draw_margin(draw, pf::irect(0, y, margin_w, y + nLineHeight), nCurrentLine, styles.text_font);
+				draw_margin(draw, pf::irect(0, y, margin_w, y + nLineHeight), nCurrentLine, body_font());
 				draw_line(draw, pf::irect(pad_left, y, rcClient.right, y + nLineHeight), nCurrentLine,
-				          styles.text_font);
+				          body_font());
 			}
 
 			nCurrentLine++;

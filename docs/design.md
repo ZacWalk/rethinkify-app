@@ -15,22 +15,35 @@ platform-h (separate repo)      OS abstraction: windows, input, drawing, files, 
         ↑
 app.cpp / app_state.h           Application: window layout, document index, search, commands, session
         ↑
-view_*.h                        Panes: document views and list panels
+view_*.h                        Panes: document views, list panels and the agent pane
 document.* / document_syntax.*  Text model: lines, selection, undo, highlighting
-util.* / calc.h                 Leaf utilities
+acp.* / agent_*.*               Agent: protocol, transcript file, host
+json.* / util.* / calc.h        Leaf utilities
 ```
 
 The platform layer lives in the shared [platform-h](https://github.com/ZacWalk/platform-h) repository, pulled in by CMake and used by the other apps in the workspace. `platform.h` declares OS-free types (`window_frame`, `frame_reactor`, `draw_context`, `file_path`, …); `platform_win.cpp` is the only implementation. Nothing in this repo includes `windows.h`, and no OS parameter reaches it raw: the messages that carry data (`timer`, `dpi_changed`, `drop_files`) arrive as a decoded `pf::message_params`.
+
+### Build tooling
+
+The unmodified [dd v0.2.0](https://github.com/ZacWalk/dd/releases/tag/v0.2.0)
+runtime is vendored in `dd.ps1` and `.dd/`, with its upstream revision and file
+hashes recorded in `docs/dd-upstream.json`. It is developer tooling, not an
+application dependency. `dd.psd1` maps the Debug/Release presets and executable
+paths; CMake continues to own the build graph and platform-h acquisition. CTest
+runs the executable's `/test` entry point, with the `unit` label letting CI skip
+dd's separate desktop smoke tests.
 
 ### Threading
 
 One UI thread and one worker thread. `pf::run_async` queues work onto the worker; `pf::run_ui` marshals results back, waking the message loop through `MsgWaitForMultipleObjects`. Only two operations run off the UI thread — **folder indexing** and **search** — and both take a snapshot of what they need on the UI thread first. The worker never dereferences a live `index_item` or `document`.
 
+A hosted agent adds two more threads, one per pipe, because a blocking `ReadFile` cannot share the single worker with indexing and search. They own nothing but a byte buffer: each splits its stream into lines and hands every complete line to the UI thread through `pf::run_ui`, guarded by a shared cancelled flag so no callback can arrive after the process object is gone.
+
 Opening a document is also asynchronous, so anything that depends on the loaded text (such as selecting a search match) must be passed to `load_doc` as a completion callback. Tests use `deferred_scheduler`, which queues tasks and drains them on `pump()`, so they exercise the production ordering rather than completing inline.
 
 ### Invalidation
 
-Views never repaint directly. They set bits in an atomic mask (`invalid::doc`, `doc_layout`, `doc_caret`, `doc_scrollbar`, `list`, `windows`). The message loop calls `app_idle()` once per pump, which coalesces layout, scrollbar recalculation, caret update, list population and repaint into one pass.
+Views never repaint directly. They set bits in an atomic mask (`invalid::doc_layout`, `doc_caret`, `doc_scrollbar`, `files_layout`, `files_populate`, `search_layout`, `search_populate`, `agent_layout`, `index`, `windows`, `app_title`). The message loop calls `app_idle()` once per pump, which coalesces layout, scrollbar recalculation, caret update, list population and repaint into one pass.
 
 The document model distinguishes three notifications, and the difference is what keeps typing cheap:
 
@@ -43,13 +56,16 @@ The document model distinguishes three notifications, and the difference is what
 ## Window layout
 
 ```
-┌───────────────┬─┬───────────────────────────────┐
-│ left pane     │ │ document pane                 │
-│ files  OR     │▓│ text / markdown / csv / hex   │
-│ search        │ │                               │
-└───────────────┴─┴───────────────────────────────┘
+┌───────────────┬─┬───────────────────────────────┬─┬─────────────────┐
+│ left pane     │ │ document pane                 │ │ agent pane      │
+│ files  OR     │▓│ text / markdown / csv / hex   │▓│ session.md      │
+│ search        │ │                               │ ├─────────────────┤
+│               │ │                               │ │ input           │
+└───────────────┴─┴───────────────────────────────┴─┴─────────────────┘
                  └ splitter (5px, DPI-scaled, ratio 0.05–0.95)
 ```
+
+The agent pane is hidden by default and toggled with `Ctrl+Shift+A`. Its splitter divides only what is left of the document pane, so the two can never cross; with no room left it collapses against the right edge rather than leaving the window.
 
 `view_mode` is the cross product of `view_content` (`edit_text`, `markdown`, `csv`, `hex`) and search-panel on/off. `app_state::set_mode` swaps the document pane's reactor for the matching view class and points the left pane at either the file list or the search panel.
 
@@ -75,11 +91,13 @@ pf::frame_reactor
 └── view_base                  scroll offset and content extent, both in pixels
     ├── text_view              font metrics, screen lines, message bar, clipboard, zoom, Escape
     │   └── doc_view           document, caret, selection, word wrap, hit-testing, painting
-    │       ├── edit_doc_view          the only writable view
+    │       ├── edit_doc_view          writable: the document pane and the agent prompt
+    │       │   └── agent_input_view    the prompt, grown to fit up to five rows
     │       └── read_only_doc_view     no caret, no h-scroll, word wrap locked, keys scroll
     │           ├── markdown_doc_view
     │           ├── csv_doc_view
-    │           └── hex_doc_view
+    │           ├── hex_doc_view
+    │           └── agent_view             the session.md transcript
     └── list_view              items, selection, hover, keyboard navigation
         ├── file_list_view     folder tree, inline rename, drag-drop
         └── search_list_view   search box, grouped results
@@ -97,6 +115,7 @@ The split between `edit_doc_view` and `read_only_doc_view` is what makes the rea
 | **Markdown preview** | Read rendered `.md` | `Ctrl+M`, auto for `.md`/`.markdown` | `Escape` |
 | **CSV table** | Read `.csv` as an aligned table | auto for `.csv` | `Escape` |
 | **Hex** | Read binary files | auto for binary content | `Escape` |
+| **Agent** | Talk to a coding agent about the open folder | `Ctrl+Shift+A`, `F4` | `Escape` returns focus |
 
 Each document remembers its own content view, so switching away and back restores what you were looking at.
 
@@ -130,6 +149,99 @@ RFC 4180 parsing including quoted fields. Aligned pipe-delimited columns, a brig
 
 Offset (8 hex digits) | 16 bytes | ASCII.
 
+## Agent
+
+The agent pane hosts **GitHub Copilot CLI** as a child process (`copilot --acp --stdio`) and speaks the **Agent Client Protocol** to it — JSON-RPC 2.0 as newline-delimited JSON over the process's standard streams. The CLI owns authentication, model routing, MCP servers and the agent loop; Rethinkify is the client. `pf::find_executable` resolves `copilot` through PATHEXT only and never searches the current directory, so a file planted in the folder you opened cannot be launched in its place.
+
+The process starts on the first message, not at startup, because it is by far the largest thing in the address space — a Node single-file binary that costs a few hundred megabytes, against about thirteen for the editor itself. The `initialize` reply names the protocol version the agent will speak; anything newer than this build understands is refused there rather than half-driven.
+
+### The transcript is a file
+
+The conversation is `session.md` in the root folder: a real file, one per folder, loaded when the folder opens and reloaded when it changes underneath. That single decision provides history across restarts, an editable record, undo of an agent turn, and markdown preview of the conversation — all from machinery that already existed.
+
+The lines are authoritative and an `agent_entry` only describes a range of them, so serialising is byte-exact by construction. Parsing is total: anything unrecognised stays in the entry it appears in, so a hand-edited file can never fail to load. Only exact role headings (`## You`, `## Agent`, `## Session`, `## Thinking`, `## Error`) open an entry — otherwise the markdown headings an agent writes would split its own replies — and a body line that would look like one is escaped with a backslash. Options are markdown task-list items, so ticking one by hand does what clicking it does.
+
+Streamed output patches only the lines it touched, so a token costs one line re-layout rather than a document rebuild. The file is written when the transcript settles, never per token. **This is the one deliberate exception to "no background writes"**: one write per turn, to a file you can see, caused by something you asked for. Older history rolls into `session-<stamp>.md` before the document size cap can be reached.
+
+The transcript has its own `document_events` sink. Sharing `app_state` would route its edits to the document pane and corrupt that pane's word-wrap cache.
+
+### The file is ours, the memory is the agent's
+
+An ACP session lives in the agent process, so the transcript on disk and what the agent recalls are two different things. They part company whenever the process is new and the file is not: after a restart, after the agent dies, and after the folder changes — `cwd` is fixed when the session is created, so a new root folder has to mean a new session.
+
+Rather than show a full conversation to an agent that remembers none of it, `agent_host` gives a new session what it missed. `transcript_digest` renders the file back to prose — the exchange only, never the session block, local notes or thinking — keeps the most recent **16 KB** because only the tail still bears on the next turn, and rides in front of the first prompt of that session as its own content block, labelled as history rather than as a request. Edits you made to the file by hand travel with it, which is what makes the transcript worth editing. A live session is never told twice.
+
+`session/load` would be the protocol's own answer, and is deliberately not used: it replays the whole conversation back as `session/update` notifications, which this design would write into the file a second time. The digest costs one block and works against agents that never implement it.
+
+Each prompt also carries what the editor can see and the agent cannot — the open file, whether it has unsaved changes, the caret line, and up to **4 KB** of the selection. `app_state::agent_context` gathers it on the UI thread through `agent_host::gather_context`, so "explain this" means something.
+
+A turn is one prompt at a time. A message typed while the agent is working joins a queue and goes when the turn ends, and questions queue the same way: an agent that asks two things at once has both recorded, but only the one at the head is written to the file, so a typed number can only ever mean the question on screen. Anything still queued when the agent dies is reported as lost rather than sent to its replacement.
+
+### The prompt is the editor again
+
+The pane is two windows, not one: the transcript above, and below it `agent_input_view` — an `edit_doc_view` over a document of its own. Reusing the editor rather than growing a widget is what gives the prompt mouse and keyboard selection, cut/copy/paste, word wrap, spell check and undo without writing any of them twice. Editing commands ask what has focus, so `Ctrl+Z` in the prompt cannot reach the document pane. Like the transcript, it has its own `document_events` sink.
+
+It grows to fit what you type, up to five rows, and scrolls past that. `layout_views` asks the view how tall it wants to be, so the height follows the wrapped row count and the agent font size. Typing at the transcript, which is read-only, hands the character to the prompt.
+
+### Tools and files
+
+Every tool call the agent proposes arrives as a permission request and is shown with numbered options; nothing runs until you answer by typing the number or clicking it, and the choice is ticked in the file so the record matches what was sent. `/m` reuses the same numbered-option mechanism for choosing a model, answering locally instead of replying to the agent. `/yolo` answers for you — it is recorded in the session block but **never resumed from a file**, so a session saved with it on comes back with it off and a note saying so.
+
+Rethinkify advertises `fs/read_text_file` and `fs/write_text_file`, so an agent that honours them reads unsaved work from the open document and writes through `replace_text` inside an `undo_group`. Every path is refused unless it canonicalises to somewhere inside the open folder, which closes both `..` traversal and links.
+
+### Commands
+
+| | |
+|---|---|
+| `/help`, `/h` | Prompt help, generated from the same table that drives the parser |
+| `/clear`, `/c` | Empty the transcript. An ordinary edit, so `Ctrl+Z` brings it back |
+| `/stop`, `/s` | Stop the current turn |
+| `/models`, `/m` | Offer the models the agent reported as numbered options, or set one by id |
+| `/yolo` | Toggle running tools without asking |
+
+Anything else beginning with `/` is forwarded when the agent advertised it, and reported locally when it did not.
+
+## Project tools
+
+The **Tools** menu runs the root folder's `dd.ps1` and, later, CMake and the compiler. Nothing here is a linked dependency — they are the user's own toolchain, started with `pf::spawn_child_process` as an argument array, never as an assembled shell string, and never with `-ExecutionPolicy`. See [cpp.md](cpp.md) for the whole plan.
+
+The menu's contents come from the script rather than from a hard-coded list. When the index finishes, `discover_tools` asks PowerShell to parse `dd.ps1` with `Parser::ParseFile` and print the parameter AST as JSON — it *reads* the script, never runs it, so opening a folder can never execute anything. A first positional parameter's `ValidateSet` becomes the commands; any other parameter with a set becomes a submenu of choices. With no `dd.ps1` the menu says so and stays disabled.
+
+The shared dd driver used to build this repository has no such parameter
+block. Current discovery therefore falls back to **Run dd.ps1** (dd help);
+use PowerShell or VS Code tasks to build this repository until the editor
+supports the shared driver's manifest interface. Legacy script discovery
+is unchanged.
+
+`tools::runner` is the one execution path. A run produces a `tools::result` — command line, exit code, elapsed time, output with stderr identified per line, parsed diagnostics and failed targets. The generated `tool-output.md` document is one *rendering* of that value; the message bar and, later, the error list and MCP replies are others. Nothing exists only inside the document.
+
+Only one tool runs at a time, but a second request is **queued rather than refused**, carrying the identity of whoever asked, so a build an agent starts while the user's build is running waits its turn instead of silently doing nothing. Output is bounded — the first and last few thousand lines, with a count of what was dropped. A dirty document prompts save / discard / cancel before anything runs, and `clean` confirms every time.
+
+`tool_output.cpp` turns the merged stream into diagnostics: MSVC, clang, the linker, CMake's indented error blocks, Ninja progress and `FAILED:` targets, CTest failures and PowerShell error records. ANSI escapes are stripped first. A `note:` attaches to the diagnostic above it, as does the indented block under it — MSVC's `with [ _Ty=int ]` template context belongs to the note it follows, not to the file. A line that matches nothing is kept verbatim; nothing is ever dropped.
+
+`F8` and `Shift+F8` step through the last run's diagnostics, wrapping in both directions, opening each file and putting the caret on the reported line and column. A diagnostic that names no line — a linker error naming an object file — reports in the message bar and moves nothing.
+
+## C++ navigation
+
+Rethinkify parses C++ itself. `cpp_lex` produces a token stream — raw strings, line splices, directive continuations and all — and `cpp_index` walks it at declaration level, **skipping function bodies wholesale**, which is what makes it fast and what keeps it out of the hardest parts of the language. A symbol is name, scope, file, offset, line, column and kind; names and scopes are interned, and symbols are keyed by file so one file can be reparsed and spliced back. The whole of `src/` indexes at around 80 MB/s.
+
+The index is rebuilt on the worker thread after a folder refresh, from paths snapshotted on the UI thread. Source files are decoded to UTF-8, including UTF-16 input, so index positions match document byte coordinates. A generation check rejects results from an older refresh or root folder. Only the UI thread reads the published index; resident source documents override disk text when it is published and before a lookup, including unsaved edits and undo back to saved text.
+
+`F12` resolves the name at the caret, ranks the candidates — definitions before declarations, the current file before others, a type before a variable — and jumps to the best. Names resolve *lexically*, so an overload set is a set: pressing `F12` again on the same name offers the next candidate, and the message bar says which one of how many. That is the picker, without a popup. `Ctrl+F12` switches between a header and its source, preferring the sibling in the same folder. `Alt+Left` and `Alt+Right` walk two stacks of visited locations.
+
+Right-clicking C/C++ text focuses the editor and offers **Go to Definition** and
+**Switch Header/Source** alongside the usual editing commands. Definition lookup
+uses the clicked name even inside a selection; Copy keeps the original selection
+until a navigation command is chosen. Keyboard-opened context menus use the caret.
+These commands are available only in the focused C/C++ text view, including
+read-only source, not in previews, the file list, or the agent prompt.
+
+Candidate cycling retains the original file preference until the caret moves,
+so jumping into another file cannot reorder the next result. Navigation messages
+and selections are applied after asynchronous loading completes. Back/Forward
+skip deleted entries, clamp obsolete positions to valid UTF-8 boundaries, and
+reset when the root folder changes.
+
 ## Commands and keyboard
 
 One `std::vector<command_def>` (`app_state::make_commands`) is the single source of truth for the menu bar, the enable/check state, the runtime accelerator table and the generated About document. Each entry owns its own lambda; adding a command is one table entry. Commands report through the message bar at the top of the document pane.
@@ -150,11 +262,12 @@ Help ▸ About (`F1`) and Help ▸ Run Tests (`Ctrl+T`) generate a read-only, ne
 |---|---|
 | **File** | `Ctrl+N` new · `Ctrl+O` open · `Ctrl+S` save · `Ctrl+Shift+S` save all · File ▸ Save As · File ▸ Exit |
 | **Edit** | `Ctrl+Z` undo (`Alt+Backspace`) · `Ctrl+Y` redo · `Ctrl+X`/`Ctrl+C`/`Ctrl+V` (also `Shift+Del`, `Ctrl+Ins`, `Shift+Ins`) · `Delete` · `Ctrl+A` · `Ctrl+R` reformat JSON · `Ctrl+E` calculate selection · `Ctrl+Shift+P` spell check · Edit ▸ Sort & Remove Duplicates |
-| **View** | `Alt+Z` word wrap (editor only) · `Ctrl+M` markdown preview · `F5` refresh · `F8` / `Shift+F8` next/previous result (search only) · `Ctrl+Shift+F` search · `Ctrl++` / `Ctrl+-` / `Ctrl+Wheel` zoom |
+| **View** | `Alt+Z` word wrap (editor only) · `Ctrl+M` markdown preview · `F5` refresh · `F8` / `Shift+F8` next/previous result (search only) · `Ctrl+Shift+F` search · `Ctrl+Shift+A` agent panel · `F4` message agent · `Ctrl++` / `Ctrl+-` / `Ctrl+Wheel` zoom |
 | **Help** | `Ctrl+T` run tests · `F1` about |
 | **Caret** | arrows · `Ctrl+←/→` word · `Home`/`End` · `Ctrl+Home`/`Ctrl+End` · `PageUp`/`PageDown` · `Ctrl+↑/↓` scroll only · add `Shift` to extend the selection |
 | **Editing** | `Tab` / `Shift+Tab` indent · `Backspace` · `Ctrl+Backspace` delete word left |
 | **Read-only views** | arrows, `Home`/`End`, `PageUp`/`PageDown` scroll · `Escape` returns to the editor |
+| **Agent** | `Enter` send · `Shift+Enter` new line · `↑`/`↓` previous prompts · `PageUp`/`PageDown` scroll the transcript · `Escape` back to the editor |
 | **Panels** | `↑`/`↓` navigate and preview · `Enter` open (or expand/collapse a folder or search group) · `F2` rename · `Delete` delete file · `Escape` close search |
 
 Help ▸ About (`F1`) generates the authoritative shortcut list from the command table at runtime.
@@ -169,16 +282,19 @@ Three modes — `auto_detect` (default; active for `.md` and `.txt`), `enabled`,
 
 ## Configuration
 
-An INI beside the executable when that folder is writable, otherwise `%LOCALAPPDATA%\Rethinkify\rethinkify.ini`. Written at shutdown; command-line modes (`/test`, `/spell:`) never write it.
+An INI beside the executable when that folder is writable, otherwise `%LOCALAPPDATA%\Rethinkify\rethinkify.ini`. Written at shutdown, so no command-line mode ever writes it.
 
 | Section | Keys |
 |---|---|
 | `Window` | `Left`, `Top`, `Right`, `Bottom`, `Maximized` |
 | `Font` | `TextSize`, `ListSize` (clamped 8–72) |
 | `Splitter` | `PanelRatio` (clamped 0.05–0.95, default 0.2) |
+| `Agent` | `Visible`, `SplitterRatio` (0.05–0.95), `FontSize` (8–72) |
 | `View` | `WordWrap`, `SpellCheck` |
 | `Recent` | `Folder`, `Document` |
 | `RecentFolders` | `Folder1`–`Folder8`, `Document1`–`Document8` |
+
+The agent's own settings — the model, and whether tools run without asking — live in `session.md` rather than here, so they travel with the conversation.
 
 Restored paths are validated: UNC and non-existent roots are skipped. Passing a file on the command line skips session restore entirely.
 
@@ -188,9 +304,11 @@ Restored paths are validated: UNC and non-existent roots are skipped. Passing a 
 |---|---|
 | `rethinkify-64d.exe /test` | Run the unit tests to stdout; exit 0 on success, 1 on any failure. No GUI. |
 | `rethinkify-64d.exe /spell:<word>` | Print spell-checker diagnostics and suggestions. No GUI. |
+| `rethinkify-64d.exe /acp[:<prompt>]` | Start the agent and run the protocol handshake, optionally sending one prompt. Tests the process and protocol layers. No GUI. |
+| `rethinkify-64d.exe /agent:<prompt>` | Run one turn through the same host the panel uses, printing the transcript. Tests the whole agent path. No GUI. |
 | `rethinkify-64d.exe <path>` | Open a file. Arguments starting with `/` or `-` are ignored; the last plain argument wins. |
 
-Both `/x` and `--x` forms are accepted.
+Both `/x` and `--x` forms are accepted. Neither agent diagnostic ever approves a tool call, and `/agent:` refuses the file bridge outright, so nothing is written on their behalf.
 
 ## Known limitations
 
@@ -198,3 +316,5 @@ Both `/x` and `--x` forms are accepted.
 - Markdown and CSV preview cannot hit-test a click, so those views have no drag selection.
 - Case-insensitive search folds ASCII and Latin-1; other scripts compare case-sensitively.
 - Saving a UTF-32 file writes UTF-8; UTF-8 and UTF-16 round-trip.
+- The agent needs GitHub Copilot CLI installed and signed in, and it dominates memory use — the editor is around 13 MB, the agent a few hundred.
+- Copilot CLI reads and writes files itself rather than calling the client's `fs/*` methods, so its edits do not currently pass through the document model's undo. The bridge is implemented for agents that do use it.

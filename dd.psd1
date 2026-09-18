@@ -1,11 +1,13 @@
 @{
     schema = 1
     project = @{
-        name = 'noterad'
+        name = 'rethinkify'
         type = 'gui'
-        'default-target' = 'app'
+        'default-target' = 'rethinkify'
     }
-    dependencies = @{ owner = 'dd' }
+    dependencies = @{
+        owner = 'application'
+    }
     build = @{
         'x64-windows' = @{
             debug = 'debug'
@@ -14,12 +16,12 @@
     }
     targets = @(
         @{
-            id = 'app'
+            id = 'rethinkify'
             kind = 'gui'
             'cmake-target' = 'rethinkify'
-            'test-label' = 'noterad'
-            'debug-path' = 'exe/rethinkify-64d{exe}'
-            'release-path' = 'exe/rethinkify-64{exe}'
+            'test-label' = 'rethinkify'
+            'debug-path' = 'exe/rethinkify-64d.exe'
+            'release-path' = 'exe/rethinkify-64.exe'
             platforms = @('x64-windows')
         }
     )

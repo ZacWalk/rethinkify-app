@@ -26,14 +26,20 @@ public:
 	[[nodiscard]] int scroll_line() const { return _scroll_offset.y / _font_extent.cy; }
 	[[nodiscard]] int scroll_char() const { return _scroll_offset.x / _font_extent.cx; }
 
+	// The text a view shows in its bar; the agent pane reports the agent instead
+	[[nodiscard]] virtual std::string_view status_text() const { return _events.message_bar_text(); }
+
 	[[nodiscard]] int message_bar_height() const
 	{
-		return _events.message_bar_text().empty() ? 0 : _font_extent.cy + _font_extent.cy / 2;
+		return status_text().empty() ? 0 : _font_extent.cy + _font_extent.cy / 2;
 	}
 
 	text_view(app_events& events) : _events(events)
 	{
 	}
+
+	// The font a view renders its text in; the agent pane sizes itself independently
+	[[nodiscard]] virtual pf::font body_font() const { return _events.styles().text_font; }
 
 	virtual void update_focus(pf::window_frame_ptr& window)
 	{
@@ -183,7 +189,7 @@ public:
 		const auto& styles = _events.styles();
 
 		_view_extent = extent;
-		_font_extent = measure.measure_char(styles.text_font);
+		_font_extent = measure.measure_char(body_font());
 		_font_extent.cx = std::max(1, _font_extent.cx);
 		_font_extent.cy = std::max(1, _font_extent.cy);
 		_screen_lines = extent.cy / _font_extent.cy;
@@ -416,7 +422,7 @@ virtual void draw_view(pf::window_frame_ptr& window,
 
 	void draw_message_bar(pf::draw_context& draw) const
 	{
-		const auto text = _events.message_bar_text();
+		const auto text = status_text();
 		if (text.empty()) return;
 
 		const auto& styles = _events.styles();
@@ -430,7 +436,7 @@ virtual void draw_view(pf::window_frame_ptr& window,
 
 		draw.fill_solid_rect(bar_rc, bg);
 		draw.draw_text(text_x, pad_y, bar_rc, text,
-		               styles.text_font, ui::text_color, bg);
+		               body_font(), ui::text_color, bg);
 	}
 
 	void scroll_by(const int delta)

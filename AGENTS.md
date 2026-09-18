@@ -5,8 +5,8 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 ## Non-negotiables
 
 1. **Windows-only code lives in the platform layer.** Everything in this repo talks to `pf::` abstractions declared in `platform.h`, which lives in the shared **platform-h** repository along with its Win32 implementation. No `windows.h` types, Win32 API calls, `HWND`/`HDC`, or Win32 constants anywhere in this repo. A change that needs a new OS capability goes into platform-h first, with its test in `tests/platform_tests.cpp` — then push it and bump `GIT_TAG` in `CMakeLists.txt`, or CI and a fresh clone build against the old revision. The other apps build against the same header, so a signature change breaks them until they bump their own pin.
-2. **Build with CMake + Ninja.** `.\dd.ps1 build debug`, or `cmake --preset debug && cmake --build --preset debug` from an x64 Developer PowerShell. platform-h is pulled in by `FetchContent`, preferring a sibling `..\platform-h` checkout when one exists — develop the two together there. Do not add other dependencies.
-3. **Run the tests.** `.\dd.ps1 test` (or `exe\rethinkify-64d.exe /test`) — exits 0 on success, 1 on any failure. Add a test in `tests.cpp` for every behaviour you fix, and run platform-h's own suite after touching it.
+2. **Build with CMake + Ninja.** In PowerShell 7.4+, use `.\dd.ps1 build debug` (`build` alone builds both configurations). The pinned shared dd driver and `dd.psd1` map to the existing CMake presets; keep the vendored runtime unmodified. platform-h is still owned by `CMakeLists.txt`, preferring a sibling `..\platform-h` checkout when one exists — develop the two together there. Do not add other dependencies.
+3. **Run the tests.** `.\dd.ps1 test --label unit` builds and runs the existing `/test` suite through CTest in both configurations without a GUI; unfiltered `test` also runs desktop smoke tests. The unit runner remains `exe\rethinkify-64d.exe /test` — exits 0 on success, 1 on any failure. Add a test in `tests.cpp` for every behaviour you fix, and run platform-h's own suite after touching it.
 4. **Optimise for small and fast.** This is the point of the project. Avoid per-keystroke or per-paint allocation, avoid O(document) work for a local edit, prefer `string_view` and reusable buffers. Delete dead code rather than leaving it.
 5. **Temporary files go in `tmp/`.**
 
@@ -15,23 +15,25 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 - Modern C++ in `snake_case`. Some older code uses Win32 Hungarian (`nActualItems`, `pBuf`, `dwCookie`) — convert it when you touch it, do not add more.
 - Text coordinates are **UTF‑8 byte offsets**, never codepoints or columns. Use `pf::utf8_prev` / `pf::utf8_next` to step; never `++`/`--` a byte index over text that may be non-ASCII.
 - Views never repaint directly. Raise an `invalid::*` bit and let `app_idle` coalesce the work.
-- Off-thread work must operate on a snapshot taken on the UI thread. The worker must not touch a live `document` or `index_item`.
+- Off-thread work must operate on a snapshot taken on the UI thread. The worker must not touch a live `document` or `index_item`. A hosted agent adds a reader thread per pipe; those own nothing but a byte buffer and marshal every line back through `pf::run_ui`.
+- A `document` belongs to one view's event sink. The agent transcript has its own, because routing its edits to the document pane would corrupt that pane's wrap cache.
 - Comments explain *why*, in one line. Do not narrate what the next line does.
 
 ## Where things live
 
 | Area | Files |
 |---|---|
-| Platform abstraction | the separate **platform-h** repo: `platform.h` and `platform_win.cpp` (entry point, windowing, drawing, files, config, clipboard, spell check, async), shared with the other apps |
-| Application | `app.h`, `app.cpp` (main window, panes, splitter, document index, search, session), `app_state.h` (state and testable logic) |
+| Platform abstraction | the separate **platform-h** repo: `platform.h` and `platform_win.cpp` (entry point, windowing, drawing, files, config, clipboard, spell check, async, child processes, path containment), shared with the other apps |
+| Application | `app.h`, `app.cpp` (main window, panes, splitters, document index, search, session), `app_state.h` (state and testable logic) |
 | Commands | `commands.h`, `commands.cpp` (`command_def` and lookup), `app_commands.cpp` (the command table and menu builder) |
 | Text model | `document.h`, `document.cpp` (lines, selection, undo, load/save, JSON reformat, sort), `document_syntax.cpp` (C++, Rust, Python, PowerShell, Markdown, hex highlighters) |
-| Document views | `view_base.h` → `view_text.h` → `view_doc.h` → `view_doc_edit.h` (editable) and `view_doc_readonly.h` → `view_doc_markdown.h`, `view_doc_csv.h`, `view_doc_hex.h` |
+| Document views | `view_base.h` → `view_text.h` → `view_doc.h` → `view_doc_edit.h` (editable) → `view_agent_input.h`, and `view_doc_readonly.h` → `view_doc_markdown.h`, `view_doc_csv.h`, `view_doc_hex.h`, `view_agent.h` |
 | Panel views | `view_list.h` → `view_list_files.h`, `view_list_search.h` |
+| Agent | `acp.h`/`acp.cpp` (Agent Client Protocol), `agent_session.h`/`.cpp` (`session.md` format, slash commands), `agent_host.h`/`.cpp` (process, turn, permissions) |
 | Widgets | `ui.h` (colours, `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |
-| Utilities | `util.h`/`util.cpp` (string ops, colour), `calc.h` (expression parser for Calculate Selection), `gitignore.h` (index filtering) |
+| Utilities | `util.h`/`util.cpp` (string ops, colour), `json.h`/`json.cpp` (JSON DOM), `calc.h` (expression parser for Calculate Selection), `gitignore.h` (index filtering) |
 | Tests | `test.h` (assertions and runner), `tests.cpp` |
-| Build | `CMakeLists.txt` (declares the app with `platform_add_app()` — icon, manifest and version info are generated, so there is no `.rc`), `CMakePresets.json`, `dd.ps1`, `pch.h`, `targetver.h` |
+| Build | `CMakeLists.txt` (declares the app with `platform_add_app()` and registers its `/test` suite with CTest), `CMakePresets.json`, `dd.psd1` (project settings), `dd.ps1` / `.dd/` (unmodified shared driver, hashes in `docs/dd-upstream.json`), `pch.h`, `targetver.h` |
 
 ## Adding a command
 
@@ -45,27 +47,38 @@ Global accelerators fire regardless of focus, so a command that acts on "the sel
 |---|---|
 | `exe\rethinkify-64d.exe /test` | Run unit tests to stdout, no GUI |
 | `exe\rethinkify-64d.exe /spell:<word>` | Spell-checker diagnostics for `<word>`, no GUI |
+| `exe\rethinkify-64d.exe /acp[:<prompt>]` | Agent protocol handshake against the real CLI, no GUI |
+| `exe\rethinkify-64d.exe /agent:<prompt>` | One turn through the host the panel uses, no GUI |
 
-Both accept `/x` and `--x`. Neither writes configuration.
+All accept `/x` and `--x`. None writes configuration. **Output is only captured when stdout is piped** (`| Out-String`); redirecting to a file yields nothing, because the console binding reopens stdout.
+
+The two agent modes exist because `pf::run_ui` callbacks never drain under `/test` — there is no message loop — so the process and protocol layers cannot be unit tested. Run `/agent:` after changing anything in `agent_host` or the platform's child-process code. Unit tests must never launch a real agent: inject `spawn` and `locate` on `agent_host`, or drive it with a fake transport through `connect`.
+
+## Agent layering
+
+The platform layer only starts the process and moves bytes: `pf::spawn_child_process` creates the pipes, runs a reader thread per pipe, reassembles whole lines with `pf::line_splitter`, and delivers each one on the UI thread. It knows nothing of JSON, ACP or the transcript. Keep it that way — a protocol change must not reach `platform_win.cpp`.
+
+Above it, `child_transport` adapts `pf::child_process::write_line` to `acp::transport`, `acp::client` speaks the protocol, and `agent_host` owns the turn, the question queue and the permission prompts. The agent's file reads and writes go through `agent_host::events`, so they see unsaved work and land in the undo stack; both refuse a path that `pf::is_path_within` says is outside the root.
 
 ## dd build system
 
-This repo uses the vendored dd build system. dd has two modes.
+This repo vendors dd v0.2.0. It has two modes.
 
 **CLI mode** is the default; each verb runs once and exits:
 
 ```pwsh
-.\dd.ps1 test                  # build both configs and run the suite
+.\dd.ps1 test --label unit
 .\dd.ps1 build debug
 .\dd.ps1 doctor --json
-.\dd.ps1 commands --json       # list this project's own commands
+.\dd.ps1 commands --json
 ```
 
-**MCP mode** — `.\dd.ps1 mcp` turns the process into a stdio JSON-RPC server for an
-MCP client, adapting typed requests onto CLI mode. It owns stdout for protocol
+**MCP mode** — `.\dd.ps1 mcp` turns the process into a stdio JSON-RPC server for
+an MCP client, adapting typed requests onto CLI mode. It owns stdout for protocol
 messages, so it prints no result envelope and rejects `--json`. Register it with
-`.\dd.ps1 ide --mcp`.
+`.\dd.ps1 ide --mcp`; add `--allow-execution` only when project-code execution
+is intended.
 
-Project settings live in `dd.psd1`; dependency pins live in
-`cmake/dd-dependencies.json` with `dependencies.owner = 'dd'`. Vendored dd file
-hashes are recorded in `docs/dd-upstream.json`.
+Project settings live in `dd.psd1`. CMake owns the platform-h dependency
+(`dependencies.owner = 'application'`). Vendored dd file hashes are recorded in
+`docs/dd-upstream.json`.

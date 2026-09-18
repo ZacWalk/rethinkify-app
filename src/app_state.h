@@ -6,6 +6,10 @@
 #include "document.h"
 #include "commands.h"
 #include "gitignore.h"
+#include "agent_session.h"
+#include "agent_host.h"
+#include "tool_runner.h"
+#include "cpp_index.h"
 #include "ui.h"
 
 
@@ -17,12 +21,16 @@ class list_view;
 class file_list_view;
 class search_list_view;
 class doc_view;
+class agent_view;
+class agent_input_view;
 struct list_view_item;
 
 using doc_view_ptr = std::shared_ptr<doc_view>;
 using text_view_ptr = std::shared_ptr<text_view>;
 using folder_view_ptr = std::shared_ptr<file_list_view>;
 using search_view_ptr = std::shared_ptr<search_list_view>;
+using agent_view_ptr = std::shared_ptr<agent_view>;
+using agent_input_view_ptr = std::shared_ptr<agent_input_view>;
 using list_view_item_ptr = std::shared_ptr<list_view_item>;
 
 
@@ -40,10 +48,14 @@ public:
 	pf::window_frame_ptr _app_window;
 	pf::window_frame_ptr _doc_window;
 	pf::window_frame_ptr _list_window;
+	pf::window_frame_ptr _agent_window;
+	pf::window_frame_ptr _agent_input_window;
 
 	doc_view_ptr _doc_view;
 	folder_view_ptr _files_view;
 	search_view_ptr _search_view;
+	agent_view_ptr _agent_view;
+	agent_input_view_ptr _agent_input_view;
 
 	async_scheduler_ptr _scheduler;
 
@@ -65,9 +77,152 @@ public:
 	std::atomic<uint32_t> _invalid = 0;
 
 	splitter _panel_splitter{splitter::orientation::vertical, 0.2};
+	splitter _agent_splitter{splitter::orientation::vertical, 0.72};
+	bool _agent_visible = false;
+
+	// The document pane never shrinks below this, however the splitters are dragged
+	[[nodiscard]] int min_pane_width() const { return static_cast<int>(160 * _styles.dpi_scale); }
+
+	void toggle_agent_panel();
+	void show_agent_panel(bool visible);
+	void focus_agent_input();
+	void on_agent_input(std::string text);
+
+	// The open document, its caret and its selection, for the agent's next prompt
+	[[nodiscard]] std::string agent_context() const;
+	void on_agent_answer(size_t index);
+	void clear_agent_session();
+	[[nodiscard]] index_item_ptr session_item();
+	[[nodiscard]] pf::irect agent_splitter_bounds(const pf::irect& bounds) const;
+
+	index_item_ptr _session_item;
+	std::shared_ptr<document_events> _agent_doc_events;
+	std::shared_ptr<document_events> _agent_input_doc_events;
+	document_ptr _agent_input_doc;
+	std::shared_ptr<agent_host::events> _agent_sink;
+	std::unique_ptr<agent_host> _agent_host;
+	std::string _agent_status;
+
+	// Set when a transcript change arrives with the tail already on screen; consumed after layout
+	bool _agent_follow_tail = false;
+
+	// Height the prompt last asked for, so a font or row-count change re-runs the layout
+	int _agent_input_height = 0;
+
+	[[nodiscard]] int agent_input_height() const;
+	[[nodiscard]] bool agent_input_has_focus() const;
+	[[nodiscard]] document_ptr focused_document() const;
+	[[nodiscard]] bool can_edit_focused_document() const;
+	void type_into_agent_input(char32_t ch);
+
+	[[nodiscard]] std::string_view agent_status_text() const override { return _agent_status; }
+	void apply_transcript_change(int first, std::span<const std::string> replacement);
+	void ensure_agent_host();
+
+	// Files the agent reads or writes are capped, so a huge file cannot exhaust memory
+	static constexpr uint32_t max_agent_file_size = 8 * 1024 * 1024;
+
+	// A selection is context, not a delivery mechanism for the whole file
+	static constexpr size_t max_agent_selection_bytes = 4 * 1024;
+
+	[[nodiscard]] bool agent_path_allowed(const pf::file_path& path, std::string& error) const;
+	bool agent_read_file(const pf::file_path& path, std::string& content, std::string& error);
+	bool agent_write_file(const pf::file_path& path, std::string_view content, std::string& error);
+
+	// Older history is moved aside before the transcript can reach the document size cap
+	static constexpr size_t max_session_bytes = 1024 * 1024;
+
+	uint64_t _session_saved_time = 0;
+	bool _session_listed = false;
+
+	[[nodiscard]] std::string load_session_text(const pf::file_path& path);
+	void reload_session_if_changed();
+	void save_session();
+	void roll_over_long_session();
 
 	std::vector<command_def> make_commands();
 	explicit app_state(async_scheduler_ptr scheduler);
+
+	//
+	// Project tools
+	//
+
+	std::unique_ptr<tools::runner> _tools;
+	tools::script_interface _script; // what the root's dd.ps1 offers
+	pf::file_path _script_path;
+	pf::file_path _powershell;
+
+	// Option name to the value last chosen, such as Config to Debug
+	std::map<std::string, std::string> _script_choices;
+
+	// What the last run reported, and where its relative paths are rooted
+	std::vector<tools::diagnostic> _diagnostics;
+	pf::file_path _diagnostics_root;
+	int _diagnostic_index = -1;
+
+	// Wraps in both directions; -1 means nothing has been visited yet
+	[[nodiscard]] static int step_diagnostic_index(int count, int current, int delta);
+
+	// Empty when the tool named no usable file, such as a linker error
+	[[nodiscard]] static pf::file_path resolve_diagnostic_path(const pf::file_path& root, std::string_view file);
+
+	void go_to_diagnostic(int delta);
+
+	//
+	// C++ navigation
+	//
+
+	// Replaced wholesale by the worker; only the UI thread reads or mutates it
+	std::shared_ptr<cpp::index> _cpp_index;
+	uint64_t _cpp_index_generation = 0;
+
+	// Where the last Go to Definition looked, so pressing it again offers the next
+	std::string _goto_word;
+	size_t _goto_next = 0;
+
+	struct visited_location
+	{
+		pf::file_path path;
+		int line = 0;
+		int column = 0;
+	};
+	pf::file_path _goto_origin;
+	visited_location _goto_destination;
+
+	static constexpr size_t max_history = 64;
+	static constexpr size_t max_indexed_source_size = 4 * 1024 * 1024;
+	std::vector<visited_location> _back;
+	std::vector<visited_location> _forward;
+
+	void rebuild_cpp_index();
+
+	// Resident documents, including undo back to saved text, override the disk index.
+	void reindex_open_documents();
+
+	[[nodiscard]] bool can_navigate_cpp() const;
+	[[nodiscard]] std::string word_at_caret() const;
+	[[nodiscard]] std::vector<cpp::symbol> rank_candidates(std::vector<cpp::symbol> found,
+	                                                     const pf::file_path& preferred_file = {}) const;
+	[[nodiscard]] std::string describe_symbol(const cpp::symbol& s) const;
+	void go_to_definition();
+	void go_to_symbol(const cpp::symbol& s, std::string message = {});
+	void switch_header_source();
+	void record_location();
+	void go_back();
+	void go_forward();
+	[[nodiscard]] bool can_go_back() const { return !_back.empty(); }
+	[[nodiscard]] bool can_go_forward() const { return !_forward.empty(); }
+
+	// 'a.cpp' to 'a.h' and back, trying the usual extensions in order
+	[[nodiscard]] static std::vector<std::string> counterpart_names(std::string_view name);
+	[[nodiscard]] static bool is_indexable_source(std::string_view path);
+
+	// Reads the root's helper script; does not run it, and does nothing without one
+	void discover_tools();
+	void run_tool(tools::command cmd);
+	void on_tool_finished(const tools::result& result);
+	[[nodiscard]] std::vector<pf::menu_command> build_tools_menu();
+	[[nodiscard]] bool tools_busy() const;
 
 	std::vector<pf::menu_command> build_menu();
 	pf::menu_command command_menu_item(command_id id,
@@ -91,6 +246,7 @@ public:
 
 	// The document may still be loading, so the match is selected from the load continuation
 	void open_path_and_select(const index_item_ptr& item, int line, int col, int length) override;
+	void open_path_and_select(const index_item_ptr& item, int line, int col, int length, std::string message);
 
 	void set_focus(view_focus v) override;
 
@@ -175,6 +331,8 @@ public:
 		if (!prompt_save_all_modified())
 			return 0; // user cancelled
 
+		// The transcript is not in the index, so it is not covered by the prompt above
+		save_session();
 		save_config();
 		_app_window->close();
 		return 0;
@@ -634,7 +792,19 @@ public:
 
 	void set_root(const index_item_ptr& root)
 	{
+		if (!_root_folder || !root || _root_folder->path != root->path)
+		{
+			_back.clear();
+			_forward.clear();
+		}
+		++_cpp_index_generation;
+		_cpp_index.reset();
+		_goto_word.clear();
 		_root_folder = root;
+
+		// Each folder has its own conversation, so the pane has to follow
+		if (_agent_visible)
+			(void)session_item();
 	}
 
 	// ── Search ─────────────────────────────────────────────────────────────
