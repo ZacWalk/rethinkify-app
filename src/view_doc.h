@@ -211,7 +211,8 @@ public:
 			const auto& line = (*_doc)[i];
 			line.render(_highlight_buf);
 
-			_parse_cookies[i] = _highlight(dwCookie, _highlight_buf, nullptr, nBlocks);
+			// An empty span asks for the cookie only; these lines are not being drawn.
+			_parse_cookies[i] = _highlight(dwCookie, _highlight_buf, {}, nBlocks);
 			assert(_parse_cookies[i] != invalid_cookie);
 			i++;
 		}
@@ -223,11 +224,11 @@ public:
 
 	// line_text must already hold the rendered text of the line being drawn
 	uint32_t highlight_line(const uint32_t cookie, const std::string_view line_text,
-	                        text_block* pBuf, int& nBlocks) const
+	                        const std::span<text_block> buf, int& nBlocks) const
 	{
-		const auto result = _highlight(cookie, line_text, pBuf, nBlocks);
+		const auto result = _highlight(cookie, line_text, buf, nBlocks);
 
-		if (_doc->spell_check() && pBuf)
+		if (_doc->spell_check() && !buf.empty())
 		{
 			const auto len = static_cast<int>(line_text.size());
 
@@ -305,12 +306,12 @@ public:
 
 			if (nBlocks > 0)
 			{
-				append_segment(0, pBuf[0]._char_pos, style::normal_text);
+				append_segment(0, buf[0]._char_pos, style::normal_text);
 				for (int i = 0; i < nBlocks; ++i)
 				{
-					const int start = pBuf[i]._char_pos;
-					const int end = i + 1 < nBlocks ? pBuf[i + 1]._char_pos : len;
-					append_segment(start, end, pBuf[i]._color);
+					const int start = buf[i]._char_pos;
+					const int end = i + 1 < nBlocks ? buf[i + 1]._char_pos : len;
+					append_segment(start, end, buf[i]._color);
 				}
 			}
 			else
@@ -318,9 +319,11 @@ public:
 				append_segment(0, len, style::normal_text);
 			}
 
-			nBlocks = static_cast<int>(spell_blocks.size());
+			// Spell runs subdivide the syntax runs, so there can be more of them than
+			// the caller left room for. Truncate rather than write past the buffer.
+			nBlocks = std::min(static_cast<int>(spell_blocks.size()), static_cast<int>(buf.size()));
 			for (int i = 0; i < nBlocks; ++i)
-				pBuf[i] = spell_blocks[i];
+				buf[i] = spell_blocks[i];
 		}
 
 		return result;
@@ -1857,10 +1860,10 @@ protected:
 		const auto nLength = static_cast<int>(line_view.size());
 
 		// Get syntax highlighting blocks for the full line
-		const auto needed = static_cast<size_t>(nLength) * 2 + 128;
+		const auto needed = pf::ui::syntax::blocks_for_line(line_view.size());
 		if (_block_buf.size() < needed)
 			_block_buf.resize(needed);
-		auto* pBuf = _block_buf.data();
+		const std::span pBuf{_block_buf};
 		auto nBlocks = 0;
 		set_parse_cookie(lineIndex, highlight_line(cookie, line_view, pBuf, nBlocks));
 
@@ -1938,10 +1941,10 @@ protected:
 		}
 
 		const auto nLength = static_cast<int>(line.size());
-		const auto needed = static_cast<size_t>(nLength) * 2 + 128;
+		const auto needed = pf::ui::syntax::blocks_for_line(line.size());
 		if (_block_buf.size() < needed)
 			_block_buf.resize(needed);
-		auto* pBuf = _block_buf.data();
+		const std::span pBuf{_block_buf};
 		auto nBlocks = 0;
 
 		// Resolve the inherited cookie first: it scans backwards using _highlight_buf

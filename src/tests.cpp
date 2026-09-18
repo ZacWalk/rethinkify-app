@@ -734,7 +734,7 @@ static void should_detect_lfcr_line_endings()
 	check_line_ending(data, sizeof(data), line_endings::crlf_style_unix, "LFCR detection");
 }
 
-static int test_md_parse(const char* text, text_block* blocks)
+static int test_md_parse(const char* text, const std::span<text_block> blocks)
 {
 	int count = 0;
 	const document_line line(std::string_view{text});
