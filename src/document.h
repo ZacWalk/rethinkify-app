@@ -72,11 +72,14 @@ enum class file_encoding
 	binary,
 };
 
+// Shared backing bytes for the lines of one loaded document.
+//
+// Always UTF-8 by the time a line points at it: an encoded file is decoded once
+// during load. A binary document is the exception — it holds raw bytes, which only
+// the hex view interprets.
 struct file_buffer
 {
 	std::vector<uint8_t> data;
-	file_encoding encoding = file_encoding::utf8;
-	int bom_length = 0;
 };
 
 using file_buffer_ptr = std::shared_ptr<const file_buffer>;
@@ -103,6 +106,9 @@ struct loaded_file_data
 	file_encoding encoding = file_encoding::utf8;
 	uint64_t disk_modified_time = 0;
 	bool truncated = false;
+	// Whether the file began with a byte-order mark, so a save can write it back.
+	// This is a property of the file, not of the line storage.
+	bool has_bom = false;
 };
 
 loaded_file_data load_lines(const pf::file_path& path);
@@ -130,12 +136,10 @@ public:
 		return _buffer ? _length == 0 : _text.empty();
 	}
 
-	// Byte length of the rendered UTF-8 text; O(1) after the first call.
+	// Byte length of the rendered UTF-8 text; O(1).
 	[[nodiscard]] size_t size() const
 	{
-		if (_byte_length == invalid_length)
-			_byte_length = static_cast<int>(compute_byte_length());
-		return static_cast<size_t>(_byte_length);
+		return _buffer ? _length : _text.size();
 	}
 
 	void render(std::string& out) const;
@@ -146,27 +150,11 @@ public:
 	void set_expanded_length(const int len) const { _expanded_length = len; }
 
 private:
-	[[nodiscard]] size_t compute_byte_length() const
-	{
-		if (!_buffer)
-			return _text.size();
-
-		if (_buffer->encoding == file_encoding::utf16 || _buffer->encoding == file_encoding::utf16be)
-		{
-			std::string line_text;
-			render(line_text);
-			return line_text.size();
-		}
-
-		return _length;
-	}
-
 	std::string _text;
 	file_buffer_ptr _buffer;
 	uint32_t _offset = 0;
 	uint32_t _length = 0;
 	mutable int _expanded_length = invalid_length;
-	mutable int _byte_length = invalid_length;
 };
 
 
@@ -263,6 +251,7 @@ class document : public std::enable_shared_from_this<document>
 	mutable uint64_t _disk_modified_time = 0;
 
 	mutable bool _modified = false;
+	bool _has_bom = false;
 	line_endings _line_ending = line_endings::crlf_style_automatic;
 	file_encoding _encoding = file_encoding::utf8;
 

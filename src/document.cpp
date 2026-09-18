@@ -68,42 +68,9 @@ void document_line::render(std::string& text_out) const
 		return;
 	}
 
-	const auto* data = _buffer->data.data() + _offset;
-
-	switch (_buffer->encoding)
-	{
-	case file_encoding::utf8:
-	case file_encoding::ascii:
-		text_out.assign(reinterpret_cast<const char*>(data), _length);
-		break;
-
-	case file_encoding::utf16:
-		{
-			const auto chars = _length / 2;
-			const std::wstring_view ws(reinterpret_cast<const wchar_t*>(data), chars);
-			pf::utf16_to_utf8(ws, text_out);
-			break;
-		}
-
-	case file_encoding::utf16be:
-		{
-			const auto chars = _length / 2;
-			std::wstring temp(chars, L'\0');
-			const auto* src = reinterpret_cast<const uint16_t*>(data);
-			for (size_t i = 0; i < chars; i++)
-				temp[i] = static_cast<wchar_t>(_byteswap_ushort(src[i]));
-			pf::utf16_to_utf8(temp, text_out);
-			break;
-		}
-
-	case file_encoding::binary:
-		text_out.assign(reinterpret_cast<const char*>(data), _length);
-		break;
-
-	default:
-		text_out.assign(reinterpret_cast<const char*>(data), _length);
-		break;
-	}
+	// The backing bytes are always UTF-8 by the time a line points at them, so
+	// rendering is a copy rather than a decode.
+	text_out.assign(reinterpret_cast<const char*>(_buffer->data.data() + _offset), _length);
 }
 
 void document_line::update(const std::string_view text)
@@ -113,7 +80,6 @@ void document_line::update(const std::string_view text)
 	_offset = 0;
 	_length = 0;
 	_expanded_length = invalid_length;
-	_byte_length = static_cast<int>(_text.size());
 }
 
 static void find_utf8_line_boundaries(const file_buffer_ptr& buffer, const int header_len,
@@ -144,37 +110,25 @@ static void find_utf8_line_boundaries(const file_buffer_ptr& buffer, const int h
 	lines.emplace_back(buffer, line_start, line_len);
 }
 
-static void find_utf16_line_boundaries(const file_buffer_ptr& buffer, const int header_len, const bool is_be,
-                                       std::vector<document_line>& lines)
+// Decode UTF-16 file bytes into UTF-8, so the line model only ever holds UTF-8.
+// Decoding is loading, which is this application's job; platform-ui's buffer is
+// defined as UTF-8 and never consults an encoding.
+static std::vector<uint8_t> transcode_utf16_to_utf8(const std::vector<uint8_t>& data,
+                                                    const int header_len, const bool is_be)
 {
-	const auto* data = buffer->data.data();
-	const auto size = static_cast<uint32_t>(buffer->data.size());
-	uint32_t line_start = static_cast<uint32_t>(header_len);
+	const auto size = data.size();
+	const auto start = static_cast<size_t>(header_len);
+	const auto chars = start < size ? (size - start) / 2 : 0;
 
-	for (uint32_t pos = line_start; pos + 1 < size; pos += 2)
-	{
-		auto c = *reinterpret_cast<const uint16_t*>(data + pos);
-		if (is_be) c = _byteswap_ushort(c);
+	std::wstring wide(chars, L'\0');
+	const auto* src = reinterpret_cast<const uint16_t*>(data.data() + start);
 
-		if (c == L'\r' || c == L'\n')
-		{
-			const auto line_len = pos - line_start;
-			lines.emplace_back(buffer, line_start, line_len);
+	for (size_t i = 0; i < chars; i++)
+		wide[i] = static_cast<wchar_t>(is_be ? _byteswap_ushort(src[i]) : src[i]);
 
-			if (c == L'\r' && pos + 3 < size)
-			{
-				auto next = *reinterpret_cast<const uint16_t*>(data + pos + 2);
-				if (is_be) next = _byteswap_ushort(next);
-				if (next == L'\n')
-					pos += 2;
-			}
-
-			line_start = pos + 2;
-		}
-	}
-
-	const auto line_len = size - line_start;
-	lines.emplace_back(buffer, line_start, line_len);
+	std::string utf8;
+	pf::utf16_to_utf8(wide, utf8);
+	return {utf8.begin(), utf8.end()};
 }
 
 static void find_binary_line_boundaries(const file_buffer_ptr& buffer,
@@ -241,7 +195,6 @@ loaded_file_data load_lines(const pf::file_path& path)
 
 		if (is_binary || is_bin_extension)
 		{
-			buffer->encoding = file_encoding::binary;
 			data.encoding = file_encoding::binary;
 			data.endings = line_endings::binary;
 
@@ -250,27 +203,29 @@ loaded_file_data load_lines(const pf::file_path& path)
 		else
 		{
 			int header_len = 0;
-			buffer->encoding = detect_encoding(buffer->data.data(), total_read, header_len);
-			buffer->bom_length = header_len;
-			data.encoding = buffer->encoding;
+			const auto encoding = detect_encoding(buffer->data.data(), total_read, header_len);
+			data.encoding = encoding;
+			data.has_bom = header_len > 0;
 			data.endings = detect_line_endings(buffer->data.data(), total_read);
 
 			// A truncated read can stop mid-character — drop the partial tail
 			if (data.truncated &&
-				(buffer->encoding == file_encoding::utf8 || buffer->encoding == file_encoding::ascii))
+				(encoding == file_encoding::utf8 || encoding == file_encoding::ascii))
 			{
 				buffer->data.resize(utf8_complete_prefix(buffer->data.data(), total_read));
 			}
 
-			if (buffer->encoding == file_encoding::utf16 || buffer->encoding == file_encoding::utf16be)
+			if (encoding == file_encoding::utf16 || encoding == file_encoding::utf16be)
 			{
-				find_utf16_line_boundaries(buffer, header_len,
-				                           buffer->encoding == file_encoding::utf16be, data.lines);
+				// The line model is UTF-8 only, so decode once here rather than on
+				// every render. data.encoding keeps the original, so a save writes
+				// the file back in the encoding it arrived in.
+				buffer->data = transcode_utf16_to_utf8(buffer->data, header_len,
+				                                       encoding == file_encoding::utf16be);
+				header_len = 0;
 			}
-			else
-			{
-				find_utf8_line_boundaries(buffer, header_len, data.lines);
-			}
+
+			find_utf8_line_boundaries(buffer, header_len, data.lines);
 		}
 
 		data.buffer = buffer;
@@ -1433,7 +1388,7 @@ bool document::save_to_file(const pf::file_path& path, const line_endings nCrlfS
 			             static_cast<std::streamsize>(wide.size() * sizeof(wchar_t)));
 		};
 
-		if (_buffer && _buffer->bom_length > 0)
+		if (_has_bom)
 		{
 			if (_encoding == file_encoding::utf16)
 			{
@@ -2045,6 +2000,7 @@ void document::apply_loaded_data(const pf::file_path& path, loaded_file_data dat
 		_read_only = data.encoding == file_encoding::binary || data.truncated;
 		_spell_check = should_spell_check_path(path);
 		_encoding = data.encoding;
+		_has_bom = data.has_bom;
 		_line_ending = data.endings;
 		_modified = false;
 		_undo_pos = 0;
