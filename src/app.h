@@ -6,6 +6,7 @@
 #include "ui/text_types.h"
 #include "ui/theme.h"
 #include "ui/view_host.h"
+#include "ui/view_text.h"
 
 class document;
 using document_ptr = std::shared_ptr<document>;
@@ -190,6 +191,7 @@ public:
 	// view_host's neutral spelling of the repaint requests. The app keeps its
 	// coalescing bitmask; the shared views never see it.
 	void invalidate_view() override { invalidate(invalid::doc); }
+	void invalidate_layout() override { invalidate(invalid::doc_layout); }
 	void invalidate_caret() override { invalidate(invalid::doc_caret); }
 	void invalidate_scrollbar() override { invalidate(invalid::doc_scrollbar); }
 	void invalidate_status() override { invalidate(invalid::windows); }
@@ -206,7 +208,10 @@ struct view_styles : pf::ui::theme
 enum class zoom_target { text, list, agent };
 
 // app_events — Full application event interface used by views and panels.
-class app_events : public document_events
+//
+// It is also the pf::ui::view_context every shared view consults for the things
+// that are the same across views: the message bar, Escape, zoom and the popup menu.
+class app_events : public document_events, public pf::ui::view_context
 {
 public:
 	virtual std::string_view message_bar_text() const = 0;

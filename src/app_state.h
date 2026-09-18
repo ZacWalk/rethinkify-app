@@ -11,16 +11,15 @@
 #include "tool_runner.h"
 #include "cpp_index.h"
 #include "ui.h"
+#include "view_doc.h"
 
 
 struct search_result;
 class app_state;
 
-class text_view;
 class list_view;
 class file_list_view;
 class search_list_view;
-class doc_view;
 class agent_view;
 class agent_input_view;
 struct list_view_item;
@@ -51,6 +50,10 @@ public:
 	pf::window_frame_ptr _agent_window;
 	pf::window_frame_ptr _agent_input_window;
 
+	// Declared before the views: each of them holds a reference to it, so it has to
+	// be constructed first.
+	view_styles _styles;
+
 	doc_view_ptr _doc_view;
 	folder_view_ptr _files_view;
 	search_view_ptr _search_view;
@@ -70,7 +73,6 @@ public:
 
 	index_item_ptr _active_item;
 	index_item_ptr _root_folder;
-	view_styles _styles;
 	view_mode _mode = view_mode::edit_text_files;
 	commands _commands;
 
@@ -637,6 +639,11 @@ public:
 	}
 
 	void on_zoom(int delta, zoom_target target) override;
+
+	// pf::ui::view_context — what every shared view asks the application for.
+	[[nodiscard]] std::string_view status_text() const override { return message_bar_text(); }
+	void on_zoom(const int delta) override { on_zoom(delta, zoom_target::text); }
+	std::vector<pf::menu_command> popup_menu_items(pf::ui::doc_view& view, const pf::ipoint& at) override;
 
 	void initialize_styles(const int lh, const int th)
 	{

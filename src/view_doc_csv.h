@@ -6,6 +6,8 @@
 
 class csv_doc_view final : public read_only_doc_view
 {
+	app_events& _events;
+
 	table_layout::table_block _table; // cached column layout for entire document
 
 	// Paint and layout scratch, reused across every row
@@ -20,7 +22,7 @@ class csv_doc_view final : public read_only_doc_view
 	}
 
 public:
-	csv_doc_view(app_events& events) : read_only_doc_view(events)
+	csv_doc_view(app_events& events) : read_only_doc_view(events, events.styles(), &events), _events(events)
 	{
 		_sel_margin = false;
 		_word_wrap = true;
@@ -28,9 +30,9 @@ public:
 
 	~csv_doc_view() override = default;
 
-	void set_document(const document_ptr& d) override
+	void set_buffer(const pf::ui::text_buffer_ptr& d, pf::ui::highlight_fn highlight) override
 	{
-		doc_view::set_document(d);
+		doc_view::set_buffer(d, std::move(highlight));
 		rebuild_table();
 	}
 
@@ -107,10 +109,10 @@ protected:
 		const auto font_cy = _font_extent.cy;
 		const auto& font = _events.styles().text_font;
 
-		const auto bg = style_to_color(style::normal_bkgnd);
-		const auto pipe_clr = style_to_color(style::md_marker);
-		const auto header_clr = style_to_color(style::md_bold);
-		const auto text_clr = style_to_color(style::normal_text);
+		const auto bg = _theme.style_color(style::normal_bkgnd);
+		const auto pipe_clr = _theme.style_color(style::md_marker);
+		const auto header_clr = _theme.style_color(style::md_bold);
+		const auto text_clr = _theme.style_color(style::normal_text);
 
 		draw.fill_solid_rect(rcClient, bg);
 

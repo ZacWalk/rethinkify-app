@@ -7,6 +7,8 @@
 
 class agent_view final : public read_only_doc_view
 {
+	app_events& _events;
+
 public:
 	// Raised when a click lands on one of the pending question's options
 	std::function<void(size_t)> on_answer;
@@ -14,7 +16,7 @@ public:
 	// Raised when a character is typed at the transcript, which belongs in the prompt instead
 	std::function<void(char32_t)> on_type;
 
-	explicit agent_view(app_events& events) : read_only_doc_view(events)
+	explicit agent_view(app_events& events) : read_only_doc_view(events, events.styles(), &events), _events(events)
 	{
 	}
 
@@ -33,9 +35,9 @@ public:
 
 	// The transcript is swapped when the root folder changes, and nothing raises a size change
 	// for that, so the scrollbar would otherwise still describe the document it replaced
-	void set_document(const document_ptr& d) override
+	void set_buffer(const pf::ui::text_buffer_ptr& d, pf::ui::highlight_fn highlight) override
 	{
-		read_only_doc_view::set_document(d);
+		read_only_doc_view::set_buffer(d, std::move(highlight));
 		layout();
 		recalc_vert_scrollbar();
 	}

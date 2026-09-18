@@ -6,12 +6,14 @@
 
 class markdown_doc_view final : public read_only_doc_view
 {
+	app_events& _events;
+
 	pf::isize _heading_font_extent[3] = {}; // cached char sizes for h1, h2, h3
 	std::vector<int> _line_pixel_y;
 	int _total_content_height = 0;
 
 public:
-	markdown_doc_view(app_events& events) : read_only_doc_view(events)
+	markdown_doc_view(app_events& events) : read_only_doc_view(events, events.styles(), &events), _events(events)
 	{
 		_sel_margin = false;
 		_word_wrap = true;
@@ -20,11 +22,11 @@ public:
 	~markdown_doc_view() override = default;
 
 	// Cached tables describe the previous document until the next layout
-	void set_document(const document_ptr& d) override
+	void set_buffer(const pf::ui::text_buffer_ptr& d, pf::ui::highlight_fn highlight) override
 	{
 		_tables.clear();
 		_line_pixel_y.clear();
-		read_only_doc_view::set_document(d);
+		read_only_doc_view::set_buffer(d, std::move(highlight));
 	}
 
 	void handle_size(pf::window_frame_ptr& window, const pf::isize extent,
@@ -181,7 +183,7 @@ protected:
 		const auto line_count = static_cast<int>(_doc->size());
 		const auto pad_top = text_top();
 
-		draw.fill_solid_rect(rcClient, style_to_color(style::normal_bkgnd));
+		draw.fill_solid_rect(rcClient, _theme.style_color(style::normal_bkgnd));
 
 		const auto left_pad = _font_extent.cx * 2;
 		const auto avail_width = rcClient.right - left_pad;
@@ -413,9 +415,9 @@ private:
 	                   const pf::font& font, const int font_cx, const int font_cy,
 	                   const bool is_header) const
 	{
-		const auto bg = style_to_color(style::normal_bkgnd);
-		const auto mk = style_to_color(style::md_marker);
-		const auto tx = is_header ? style_to_color(style::md_bold) : style_to_color(style::normal_text);
+		const auto bg = _theme.style_color(style::normal_bkgnd);
+		const auto mk = _theme.style_color(style::md_marker);
+		const auto tx = is_header ? _theme.style_color(style::md_bold) : _theme.style_color(style::normal_text);
 
 		split_cells(_cells, line_text);
 
@@ -428,8 +430,8 @@ private:
 	                              const int right, const table_block& table,
 	                              const pf::font& font, const int font_cx, const int font_cy) const
 	{
-		const auto bg = style_to_color(style::normal_bkgnd);
-		const auto mk = style_to_color(style::md_marker);
+		const auto bg = _theme.style_color(style::normal_bkgnd);
+		const auto mk = _theme.style_color(style::md_marker);
 		table_layout::draw_separator_row(draw, y, left_pad, right, table, font, font_cx, font_cy, bg, mk);
 	}
 
@@ -462,32 +464,33 @@ private:
 		std::vector<md_span> spans;
 	};
 
-	static pf::color_t color_for_span(const span_type type, const int heading_level)
+	// Static, so the theme arrives as an argument rather than through the view.
+	static pf::color_t color_for_span(const pf::ui::theme& theme, const span_type type, const int heading_level)
 	{
 		switch (type)
 		{
 		case span_type::marker:
-			return style_to_color(style::md_marker);
+			return theme.style_color(style::md_marker);
 		case span_type::bold:
-			return style_to_color(heading_level > 0
+			return theme.style_color(heading_level > 0
 				                      ? static_cast<style>(static_cast<int>(style::md_heading1) + heading_level - 1)
 				                      : style::md_bold);
 		case span_type::italic:
-			return style_to_color(style::md_italic);
+			return theme.style_color(style::md_italic);
 		case span_type::bold_italic:
-			return style_to_color(style::md_bold);
+			return theme.style_color(style::md_bold);
 		case span_type::link_text:
-			return style_to_color(style::md_link_text);
+			return theme.style_color(style::md_link_text);
 		case span_type::link_url:
-			return style_to_color(style::md_link_url);
+			return theme.style_color(style::md_link_url);
 		case span_type::bullet:
-			return style_to_color(style::md_bullet);
+			return theme.style_color(style::md_bullet);
 		case span_type::plain:
 		default:
-			if (heading_level == 1) return style_to_color(style::md_heading1);
-			if (heading_level == 2) return style_to_color(style::md_heading2);
-			if (heading_level == 3) return style_to_color(style::md_heading3);
-			return style_to_color(style::normal_text);
+			if (heading_level == 1) return theme.style_color(style::md_heading1);
+			if (heading_level == 2) return theme.style_color(style::md_heading2);
+			if (heading_level == 3) return theme.style_color(style::md_heading3);
+			return theme.style_color(style::normal_text);
 		}
 	}
 
@@ -526,7 +529,7 @@ private:
 	{
 		runs.clear();
 		const auto spell_enabled = _doc && _doc->spell_check() && spell_check_span(type);
-		const auto error_color = style_to_color(style::error_text);
+		const auto error_color = _theme.style_color(style::error_text);
 
 		const auto push_run = [&](const int start, const int length, const pf::color_t color)
 		{
@@ -807,7 +810,7 @@ private:
 	{
 		if (row_end < 0) row_end = static_cast<int>(line_text.size());
 
-		const auto bg_color = style_to_color(style::normal_bkgnd);
+		const auto bg_color = _theme.style_color(style::normal_bkgnd);
 		pf::ipoint origin(rc.left, rc.top);
 
 		if (info.spans.empty())
@@ -831,8 +834,8 @@ private:
 				          : 0;
 		}
 
-		const auto sel_text_color = style_to_color(style::sel_text);
-		const auto sel_bg_color = style_to_color(style::sel_bkgnd);
+		const auto sel_text_color = _theme.style_color(style::sel_text);
+		const auto sel_bg_color = _theme.style_color(style::sel_bkgnd);
 
 		for (const auto& span : info.spans)
 		{
@@ -849,7 +852,7 @@ private:
 			const auto vis_end = std::min(span_end, row_end);
 			const auto vis_len = vis_end - vis_start;
 
-			const auto color = color_for_span(span.type, info.heading_level);
+			const auto color = color_for_span(_theme, span.type, info.heading_level);
 			const auto text = line_text.substr(vis_start, vis_len);
 
 			build_text_runs(text, span.type, color, _runs);

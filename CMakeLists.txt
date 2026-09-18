@@ -28,7 +28,7 @@ endif()
 include(FetchContent)
 FetchContent_Declare(platform_h
     GIT_REPOSITORY https://github.com/ZacWalk/platform-h.git
-    GIT_TAG        96cf613578fcf94bb1da79a0e37435ede083c9fd
+    GIT_TAG        dd758a44b23c08bd87e27c85ea899261ec467c99
 )
 FetchContent_MakeAvailable(platform_h)
 
@@ -39,6 +39,7 @@ platform_add_app(rethinkify UI
         src/agent_session.cpp
         src/app.cpp
         src/app_commands.cpp
+        src/app_views.cpp
         src/commands.cpp
         src/cpp_index.cpp
         src/cpp_lex.cpp

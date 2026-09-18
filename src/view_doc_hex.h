@@ -6,6 +6,8 @@
 
 class hex_doc_view final : public read_only_doc_view
 {
+	app_events& _events;
+
 	static constexpr int bytes_per_line = 16;
 
 	// Column layout (in characters):
@@ -30,7 +32,7 @@ class hex_doc_view final : public read_only_doc_view
 	}
 
 public:
-	hex_doc_view(app_events& events) : read_only_doc_view(events)
+	hex_doc_view(app_events& events) : read_only_doc_view(events, events.styles(), &events), _events(events)
 	{
 	}
 
@@ -46,11 +48,11 @@ protected:
 		const auto cx = _font_extent.cx;
 		const auto cy = _font_extent.cy;
 
-		const auto bg = style_to_color(style::normal_bkgnd);
-		const auto offset_color = style_to_color(style::code_number);
-		const auto hex_color = style_to_color(style::code_keyword);
-		const auto ascii_color = style_to_color(style::code_string);
-		const auto separator_color = style_to_color(style::code_comment);
+		const auto bg = _theme.style_color(style::normal_bkgnd);
+		const auto offset_color = _theme.style_color(style::code_number);
+		const auto hex_color = _theme.style_color(style::code_keyword);
+		const auto ascii_color = _theme.style_color(style::code_string);
+		const auto separator_color = _theme.style_color(style::code_comment);
 
 		draw.fill_solid_rect(rcClient, bg);
 

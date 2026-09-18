@@ -26,14 +26,6 @@ std::string g_app_name = "Rethinkify";
 extern std::string run_all_tests();
 extern tests::run_result run_all_tests_result();
 
-// The palette lives in platform-ui now. Phase 4 hands views a theme& directly and
-// this function goes away; until then it keeps the 47 existing call sites working.
-pf::color_t style_to_color(const style style_index)
-{
-	static const pf::ui::theme palette;
-	return palette.style_color(style_index);
-}
-
 static std::string make_about_text(const commands& cmds)
 {
 	std::string text =
@@ -221,10 +213,10 @@ namespace
 		case view_content::csv:
 			return std::make_shared<csv_doc_view>(app);
 		case view_content::edit_text:
-			return std::make_shared<edit_doc_view>(app);
+			return make_edit_doc_view(app);
 		}
 
-		return std::make_shared<edit_doc_view>(app);
+		return make_edit_doc_view(app);
 	}
 
 	std::string view_message_text(const view_mode mode, const document_ptr& doc)
@@ -557,7 +549,7 @@ public:
 	}
 };
 
-app_state::app_state(async_scheduler_ptr scheduler) : _doc_view(std::make_shared<edit_doc_view>(*this)),
+app_state::app_state(async_scheduler_ptr scheduler) : _doc_view(make_edit_doc_view(*this)),
                                                       _files_view(std::make_shared<file_list_view>(*this)),
                                                       _search_view(std::make_shared<search_list_view>(*this)),
                                                       _agent_view(std::make_shared<agent_view>(*this)),
@@ -567,11 +559,11 @@ app_state::app_state(async_scheduler_ptr scheduler) : _doc_view(std::make_shared
 	_active_item = std::make_shared<index_item>();
 	_active_item->doc = std::make_shared<document>(*this);
 	_root_folder = std::make_shared<index_item>();
-	_doc_view->set_document(active_item()->doc);
+	_doc_view->set_buffer(active_item()->doc, highlight_for(active_item()->doc));
 
 	_agent_input_doc_events = std::make_shared<agent_input_doc_events>(*this);
 	_agent_input_doc = std::make_shared<document>(*_agent_input_doc_events);
-	_agent_input_view->set_document(_agent_input_doc);
+	_agent_input_view->set_buffer(_agent_input_doc, highlight_for(_agent_input_doc));
 	_agent_input_view->on_submit = [this](std::string text) { on_agent_input(std::move(text)); };
 
 	_agent_view->on_answer = [this](const size_t index) { on_agent_answer(index); };
@@ -1263,7 +1255,7 @@ void app_state::set_mode(const view_mode m)
 		if (_doc_view)
 			_doc_view->stop_caret_blink(_doc_window);
 
-		new_view->set_document(active_item()->doc);
+		new_view->set_buffer(active_item()->doc, highlight_for(active_item()->doc));
 		if (view_content_of(m) == view_content::edit_text)
 			new_view->set_word_wrap(_word_wrap);
 
@@ -1275,7 +1267,7 @@ void app_state::set_mode(const view_mode m)
 	}
 	else
 	{
-		_doc_view->set_document(active_item()->doc);
+		_doc_view->set_buffer(active_item()->doc, highlight_for(active_item()->doc));
 	}
 
 	_list_window->show(true);
@@ -1761,7 +1753,7 @@ void app_state::show_agent_panel(const bool visible)
 		_agent_input_window->show(visible);
 
 	if (visible && _agent_view)
-		_agent_view->set_document(session_item()->doc);
+		_agent_view->set_buffer(session_item()->doc, highlight_for(session_item()->doc));
 
 	layout_views();
 	invalidate(invalid::windows | invalid::agent_layout);
@@ -1805,7 +1797,7 @@ index_item_ptr app_state::session_item()
 	_session_listed = false;
 
 	if (_agent_view)
-		_agent_view->set_document(_session_item->doc);
+		_agent_view->set_buffer(_session_item->doc, highlight_for(_session_item->doc));
 
 	return _session_item;
 }

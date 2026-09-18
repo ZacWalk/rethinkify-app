@@ -1,4 +1,4 @@
-﻿// tests.cpp — Unit tests for document editing, undo/redo, search, and utilities
+// tests.cpp — Unit tests for document editing, undo/redo, search, and utilities
 
 #include "pch.h"
 #include "app.h"
@@ -3130,7 +3130,7 @@ static void should_scroll_the_agent_transcript()
 	const auto doc = std::make_shared<document>(null_ev, long_transcript);
 	const auto view = std::make_shared<agent_view>(*state);
 
-	view->set_document(doc);
+	view->set_buffer(doc, highlight_for(doc));
 
 	// Sizing alone must arm the scrollbar: the base only raises the document pane's bit
 	view->handle_size(window, pf::isize{400, 320}, measure);
@@ -4230,7 +4230,11 @@ static void should_display_navigation_shortcuts_as_named_keys()
 class navigation_test_view final : public edit_doc_view
 {
 public:
-	using edit_doc_view::edit_doc_view;
+	explicit navigation_test_view(app_events& events)
+		: edit_doc_view(events, events.styles(), &events)
+	{
+	}
+
 	using doc_view::text_to_client;
 };
 
@@ -4243,7 +4247,7 @@ static void should_navigate_the_right_clicked_name_without_losing_copy_selection
 	state->_cpp_index = std::make_shared<cpp::index>();
 	state->reindex_open_documents();
 	const auto view = std::make_shared<navigation_test_view>(*state);
-	view->set_document(caller->doc);
+	view->set_buffer(caller->doc, highlight_for(caller->doc));
 	state->_doc_view = view;
 	stub_measure_context measure;
 	view->handle_size(state->_doc_window, {480, 320}, measure);

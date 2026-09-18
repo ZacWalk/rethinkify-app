@@ -11,7 +11,6 @@
 #include "ui/text_buffer.h"
 #include "ui/text_types.h"
 
-class doc_view;
 class document_events;
 
 // The text vocabulary lives in platform-ui, which owns the views that consume it.

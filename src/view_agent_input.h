@@ -6,13 +6,15 @@
 
 class agent_input_view final : public edit_doc_view
 {
+	app_events& _events;
+
 public:
 	static constexpr int max_rows = 5;
 	static constexpr size_t max_history = 64;
 
 	std::function<void(std::string)> on_submit;
 
-	explicit agent_input_view(app_events& events) : edit_doc_view(events)
+	explicit agent_input_view(app_events& events) : edit_doc_view(events, events.styles(), &events), _events(events)
 	{
 		_sel_margin = false;
 		_word_wrap = true;
@@ -72,7 +74,7 @@ public:
 			const pf::irect clip(text_left(), y, std::min(box.right, text_left() + width),
 			                     y + _font_extent.cy);
 			draw.draw_text(clip.left, y, clip, hint, body_font(),
-			               ui::handle_hover_color, style_to_color(style::normal_bkgnd));
+			               ui::handle_hover_color, _theme.style_color(style::normal_bkgnd));
 		}
 
 		edit_box::draw_border(draw, box, window->has_focus(), _events.styles().dpi_scale);
