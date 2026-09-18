@@ -103,7 +103,7 @@ pf::frame_reactor
         └── search_list_view   search box, grouped results
 ```
 
-The split between `edit_doc_view` and `read_only_doc_view` is what makes the read-only panes predictable: they have no caret, cannot scroll horizontally, ignore Alt+Z, ignore Shift, and their arrow keys scroll rather than move an invisible cursor. Most of them do not drag-select, because their layout is not uniform enough to hit-test a click — `Ctrl+A` still selects everything so the text can be copied. The markdown view is the exception: it hit-tests the layout it drew, so it selects like the editor. Escape always returns them to the text editor.
+The split between `edit_doc_view` and `read_only_doc_view` is what makes the read-only panes predictable: they have no caret, cannot scroll horizontally, ignore Alt+Z, ignore Shift, and their arrow keys scroll rather than move an invisible cursor. Hex does not drag-select, because its layout is not the document's — `Ctrl+A` still selects everything so the text can be copied. Markdown hit-tests the layout it drew and selects like the editor; CSV selects whole records, since a cell is drawn padded into its column. Escape always returns them to the text editor.
 
 ## Panes and what each one does
 
@@ -145,7 +145,7 @@ The view is `pf::ui::markdown_view`, shared with the other applications. It draw
 
 ### CSV table
 
-RFC 4180 parsing including quoted fields. Aligned pipe-delimited columns, a brighter header row followed by a separator, width-capped columns with wrapped cell text, and numeric right-alignment.
+RFC 4180 parsing including quoted fields. Aligned pipe-delimited columns, a brighter header row followed by a separator, width-capped columns with wrapped cell text, and numeric right-alignment. Dragging selects whole records — a cell is drawn padded into its column, so there is no byte under the pointer to select — and copying gives the records as they are in the file.
 
 ### Hex
 
@@ -315,7 +315,7 @@ Both `/x` and `--x` forms are accepted. Neither agent diagnostic ever approves a
 ## Known limitations
 
 - Documents are capped at 2 MB; a larger file opens read-only showing the first 2 MB.
-- CSV and hex preview cannot hit-test a click, so those views have no drag selection; `Ctrl+A` still copies them.
+- CSV selects and copies whole records rather than individual cells, because a cell is drawn padded into its column; hex has no drag selection at all, though `Ctrl+A` copies it.
 - A markdown table is drawn padded into its columns, so dragging over one selects whole source lines rather than individual cells.
 - Case-insensitive search folds ASCII and Latin-1; other scripts compare case-sensitively.
 - Saving a UTF-32 file writes UTF-8; UTF-8 and UTF-16 round-trip.

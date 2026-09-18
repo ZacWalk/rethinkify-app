@@ -209,9 +209,9 @@ namespace
 		case view_content::markdown:
 			return make_markdown_doc_view(app);
 		case view_content::hex:
-			return std::make_shared<hex_doc_view>(app);
+			return make_hex_doc_view(app);
 		case view_content::csv:
-			return std::make_shared<csv_doc_view>(app);
+			return make_csv_doc_view(app);
 		case view_content::edit_text:
 			return make_edit_doc_view(app);
 		}

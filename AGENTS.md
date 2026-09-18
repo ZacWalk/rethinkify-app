@@ -27,7 +27,7 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 | Application | `app.h`, `app.cpp` (main window, panes, splitters, document index, search, session), `app_state.h` (state and testable logic) |
 | Commands | `commands.h`, `commands.cpp` (`command_def` and lookup), `app_commands.cpp` (the command table and menu builder) |
 | Text model | `document.h`, `document.cpp` (a `pf::ui::text_buffer` that knows its path, encoding, line endings, load/save, JSON reformat, sort), `document_syntax.cpp` (which highlighter a document gets) |
-| Document views | `view_base.h`, `view_text.h`, `view_doc.h`, `view_doc_edit.h`, `view_doc_readonly.h` and `view_doc_markdown.h` name the shared `pf::ui` views under this application's names; `view_doc_csv.h`, `view_doc_hex.h`, `view_agent.h` and `view_agent_input.h` are still this application's own |
+| Document views | `view_base.h`, `view_text.h`, `view_doc.h`, `view_doc_edit.h`, `view_doc_readonly.h`, `view_doc_markdown.h`, `view_doc_csv.h` and `view_doc_hex.h` name the shared `pf::ui` views under this application's names; `view_agent.h` and `view_agent_input.h` are still this application's own |
 | Panel views | `view_list.h` → `view_list_files.h`, `view_list_search.h` |
 | Agent | `acp.h`/`acp.cpp` (Agent Client Protocol), `agent_session.h`/`.cpp` (`session.md` format, slash commands), `agent_host.h`/`.cpp` (process, turn, permissions) |
 | Widgets | `ui.h` (the `pf::ui` widgets under this application's names: `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |
