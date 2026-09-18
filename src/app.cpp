@@ -207,7 +207,7 @@ namespace
 		switch (view_content_of(mode))
 		{
 		case view_content::markdown:
-			return std::make_shared<markdown_doc_view>(app);
+			return make_markdown_doc_view(app);
 		case view_content::hex:
 			return std::make_shared<hex_doc_view>(app);
 		case view_content::csv:

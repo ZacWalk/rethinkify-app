@@ -23,14 +23,14 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 
 | Area | Files |
 |---|---|
-| Platform abstraction | the separate **platform-h** repo: `platform.h` and `platform_win.cpp` (entry point, windowing, drawing, files, config, clipboard, spell check, async, child processes, path containment), shared with the other apps |
+| Platform abstraction | the separate **platform-h** repo: `platform.h` and `platform_win.cpp` (entry point, windowing, drawing, files, config, clipboard, spell check, async, child processes, path containment), shared with the other apps, plus **platform-ui** (`pf::ui`): the widgets, the text buffer, the syntax highlighters and the document, markdown and editing views |
 | Application | `app.h`, `app.cpp` (main window, panes, splitters, document index, search, session), `app_state.h` (state and testable logic) |
 | Commands | `commands.h`, `commands.cpp` (`command_def` and lookup), `app_commands.cpp` (the command table and menu builder) |
-| Text model | `document.h`, `document.cpp` (lines, selection, undo, load/save, JSON reformat, sort), `document_syntax.cpp` (C++, Rust, Python, PowerShell, Markdown, hex highlighters) |
-| Document views | `view_base.h` → `view_text.h` → `view_doc.h` → `view_doc_edit.h` (editable) → `view_agent_input.h`, and `view_doc_readonly.h` → `view_doc_markdown.h`, `view_doc_csv.h`, `view_doc_hex.h`, `view_agent.h` |
+| Text model | `document.h`, `document.cpp` (a `pf::ui::text_buffer` that knows its path, encoding, line endings, load/save, JSON reformat, sort), `document_syntax.cpp` (which highlighter a document gets) |
+| Document views | `view_base.h`, `view_text.h`, `view_doc.h`, `view_doc_edit.h`, `view_doc_readonly.h` and `view_doc_markdown.h` name the shared `pf::ui` views under this application's names; `view_doc_csv.h`, `view_doc_hex.h`, `view_agent.h` and `view_agent_input.h` are still this application's own |
 | Panel views | `view_list.h` → `view_list_files.h`, `view_list_search.h` |
 | Agent | `acp.h`/`acp.cpp` (Agent Client Protocol), `agent_session.h`/`.cpp` (`session.md` format, slash commands), `agent_host.h`/`.cpp` (process, turn, permissions) |
-| Widgets | `ui.h` (colours, `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |
+| Widgets | `ui.h` (the `pf::ui` widgets under this application's names: `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |
 | Utilities | `util.h`/`util.cpp` (string ops, colour), `json.h`/`json.cpp` (JSON DOM), `calc.h` (expression parser for Calculate Selection), `gitignore.h` (index filtering) |
 | Tests | `test.h` (assertions and runner), `tests.cpp` |
 | Build | `CMakeLists.txt` (declares the app with `platform_add_app()` and registers its `/test` suite with CTest), `CMakePresets.json`, `dd.psd1` (project settings), `dd.ps1` / `.dd/` (unmodified shared driver, hashes in `docs/dd-upstream.json`), `pch.h`, `targetver.h` |
