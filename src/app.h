@@ -192,6 +192,7 @@ public:
 	void invalidate_view() override { invalidate(invalid::doc); }
 	void invalidate_caret() override { invalidate(invalid::doc_caret); }
 	void invalidate_scrollbar() override { invalidate(invalid::doc_scrollbar); }
+	void invalidate_status() override { invalidate(invalid::windows); }
 };
 
 // view_styles — the app's theme. The fonts, metrics and palette come from
