@@ -14,6 +14,7 @@
 #include "acp.h"
 #include "agent_session.h"
 #include "test.h"
+#include "ui/test_support.h"
 
 
 class null_events final : public document_events
@@ -42,140 +43,10 @@ public:
 
 static null_events null_ev;
 
-// stub_window_frame — No-op window for testing without a real platform window
-struct stub_window_frame final : pf::window_frame
-{
-	inline static const stub_window_frame* focused_window = nullptr;
-	std::vector<pf::menu_command> popup_items;
-	pf::ipoint popup_point;
-
-	~stub_window_frame() override
-	{
-		if (focused_window == this)
-			focused_window = nullptr;
-	}
-
-	void set_reactor(pf::frame_reactor_ptr) override
-	{
-	}
-
-	void notify_size() override
-	{
-	}
-
-	pf::irect get_client_rect() const override { return {}; }
-
-	void invalidate() override
-	{
-	}
-
-	void invalidate_rect(const pf::irect&) override
-	{
-	}
-
-	void set_focus() override
-	{
-		focused_window = this;
-	}
-
-	bool has_focus() const override { return focused_window == this; }
-
-	void set_capture() override
-	{
-	}
-
-	void release_capture() override
-	{
-	}
-
-	uint32_t set_timer(uint32_t, uint32_t) override { return 0; }
-
-	void kill_timer(uint32_t) override
-	{
-	}
-
-	pf::ipoint screen_to_client(const pf::ipoint pt) const override { return pt; }
-
-	void set_cursor_shape(pf::cursor_shape) override
-	{
-	}
-
-	void move_window(const pf::irect&) override
-	{
-	}
-
-	void show(bool) override
-	{
-	}
-
-	bool is_visible() const override { return false; }
-
-	void set_text(std::string_view) override
-	{
-	}
-
-	placement get_placement() const override { return {}; }
-
-	void set_placement(const placement&) override
-	{
-	}
-
-	void track_mouse_leave() override
-	{
-	}
-
-	bool is_key_down(unsigned int) const override { return false; }
-	bool is_key_down_async(unsigned int) const override { return false; }
-
-	pf::window_frame_ptr create_child(std::string_view, uint32_t, pf::color_t) const & override
-	{
-		return std::make_shared<stub_window_frame>();
-	}
-
-	void close() override
-	{
-	}
-
-	std::string text_from_clipboard() override { return {}; }
-	bool text_to_clipboard(std::string_view) override { return false; }
-
-	void present_pixels(const uint32_t*, int, int) override
-	{
-	}
-
-	pf::toolbar_frame_ptr create_address_bar(const pf::address_bar_config&) override { return nullptr; }
-
-	int message_box(std::string_view, std::string_view, uint32_t) override { return 0; }
-
-	void set_menu(std::vector<pf::menu_command>) override
-	{
-	}
-
-	std::unique_ptr<pf::measure_context> create_measure_context() const override { return nullptr; }
-
-	void show_popup_menu(const std::vector<pf::menu_command>& items, const pf::ipoint& point) override
-	{
-		popup_items = items;
-		popup_point = point;
-	}
-
-	double get_dpi_scale() const override { return 1.0; }
-
-	void accept_drop_files(bool) override
-	{
-	}
-};
-
-// stub_measure_context — fixed monospace metrics so layout is deterministic in tests
-struct stub_measure_context final : pf::measure_context
-{
-	pf::isize measure_text(const std::string_view text, const pf::font&) const override
-	{
-		return {static_cast<int>(pf::utf8_codepoint_count(text)) * 8, 16};
-	}
-
-	pf::isize measure_char(const pf::font&) const override { return {8, 16}; }
-};
+// The window and measurement stubs live in platform-ui, so every application that
+// tests a view shares one copy and only one has to change when pf::window_frame does.
+using stub_window_frame = pf::ui::test::fake_window_frame;
+using stub_measure_context = pf::ui::test::fake_measure_context;
 
 static void insert_chars(const document_ptr& doc, const std::string_view chars,
                          text_location location = text_location(0, 0))
