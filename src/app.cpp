@@ -945,7 +945,7 @@ bool app_state::can_copy_current_focus() const
 	if (list_has_focus())
 	{
 		const auto item = is_search(get_mode()) ? selected_search_list_item() : selected_file_list_item();
-		return item && item->source;
+		return item && (is_search(get_mode()) ? hit_src(item) != nullptr : src_of(item) != nullptr);
 	}
 
 	return false;
@@ -961,8 +961,8 @@ bool app_state::can_delete_current_focus() const
 
 	if (file_list_has_focus())
 	{
-		const auto item = selected_file_list_item();
-		return item && item->source && !item->source->is_folder;
+		const auto source = src_of(selected_file_list_item());
+		return source && !source->is_folder;
 	}
 
 	return false;
@@ -979,17 +979,18 @@ bool app_state::copy_current_focus_to_clipboard() const
 	if (search_list_has_focus())
 	{
 		const auto item = selected_search_list_item();
-		if (!item || !item->source)
+		const auto source = hit_src(item);
+		if (!source)
 			return false;
-		return pf::platform_text_to_clipboard(clipboard_path_text(item->source->path, item->line_number));
+		return pf::platform_text_to_clipboard(clipboard_path_text(source->path, row_of(item).line_number));
 	}
 
 	if (file_list_has_focus())
 	{
-		const auto item = selected_file_list_item();
-		if (!item || !item->source)
+		const auto source = src_of(selected_file_list_item());
+		if (!source)
 			return false;
-		return pf::platform_text_to_clipboard(clipboard_path_text(item->source->path));
+		return pf::platform_text_to_clipboard(clipboard_path_text(source->path));
 	}
 
 	return false;
@@ -1005,13 +1006,13 @@ bool app_state::delete_current_focus()
 
 	if (file_list_has_focus())
 	{
-		const auto item = selected_file_list_item();
-		if (!item || !item->source || item->source->is_folder)
+		const auto source = src_of(selected_file_list_item());
+		if (!source || source->is_folder)
 			return false;
 
-		const bool was_deleted = item->source->is_deleted;
-		delete_item(item->source);
-		return !was_deleted && item->source->is_deleted;
+		const bool was_deleted = source->is_deleted;
+		delete_item(source);
+		return !was_deleted && source->is_deleted;
 	}
 
 	return false;
@@ -1019,8 +1020,8 @@ bool app_state::delete_current_focus()
 
 bool app_state::can_rename_selected_file() const
 {
-	const auto item = selected_file_list_item();
-	return file_list_has_focus() && item && item->source && !item->source->is_folder;
+	const auto source = src_of(selected_file_list_item());
+	return file_list_has_focus() && source && !source->is_folder;
 }
 
 void app_state::begin_rename_selected_file()

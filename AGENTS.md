@@ -28,7 +28,7 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 | Commands | `commands.h`, `commands.cpp` (`command_def` and lookup), `app_commands.cpp` (the command table and menu builder) |
 | Text model | `document.h`, `document.cpp` (a `pf::ui::text_buffer` that knows its path, encoding, line endings, load/save, JSON reformat, sort), `document_syntax.cpp` (which highlighter a document gets) |
 | Document views | `view_base.h`, `view_text.h`, `view_doc.h`, `view_doc_edit.h`, `view_doc_readonly.h`, `view_doc_markdown.h`, `view_doc_csv.h` and `view_doc_hex.h` name the shared `pf::ui` views under this application's names; `view_agent.h` and `view_agent_input.h` are still this application's own |
-| Panel views | `view_list.h` → `view_list_files.h`, `view_list_search.h` |
+| Panel views | `view_list.h` names the shared `pf::ui::list_view`; `view_list_files.h` and `view_list_search.h` are this application's own, and hang an `index_item` or a search hit off each row's `data` |
 | Agent | `acp.h`/`acp.cpp` (Agent Client Protocol), `agent_session.h`/`.cpp` (`session.md` format, slash commands), `agent_host.h`/`.cpp` (process, turn, permissions) |
 | Widgets | `ui.h` (the `pf::ui` widgets under this application's names: `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |
 | Utilities | `util.h`/`util.cpp` (string ops, colour), `json.h`/`json.cpp` (JSON DOM), `calc.h` (expression parser for Calculate Selection), `gitignore.h` (index filtering) |

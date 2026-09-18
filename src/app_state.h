@@ -22,7 +22,6 @@ class file_list_view;
 class search_list_view;
 class agent_view;
 class agent_input_view;
-struct list_view_item;
 
 using doc_view_ptr = std::shared_ptr<doc_view>;
 using text_view_ptr = std::shared_ptr<text_view>;
@@ -30,7 +29,6 @@ using folder_view_ptr = std::shared_ptr<file_list_view>;
 using search_view_ptr = std::shared_ptr<search_list_view>;
 using agent_view_ptr = std::shared_ptr<agent_view>;
 using agent_input_view_ptr = std::shared_ptr<agent_input_view>;
-using list_view_item_ptr = std::shared_ptr<list_view_item>;
 
 
 class app_state final : public app_events, public pf::frame_reactor, public std::enable_shared_from_this<app_state>

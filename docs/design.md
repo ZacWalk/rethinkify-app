@@ -98,10 +98,15 @@ pf::frame_reactor
     │           ├── csv_doc_view
     │           ├── hex_doc_view
     │           └── agent_view             the session.md transcript
-    └── list_view              items, selection, hover, keyboard navigation
+    └── list_view              rows, selection, hover, keyboard navigation, row copy
         ├── file_list_view     folder tree, inline rename, drag-drop
         └── search_list_view   search box, grouped results
 ```
+
+Everything above `agent_view` and the two list panels is `pf::ui`, named locally by
+a one-line header. A list row is a `pf::ui::list_item`; the panels hang their own
+object off its `data` — an `index_item` for the folder browser, a search hit for the
+search panel — and the shared list never looks inside it.
 
 The split between `edit_doc_view` and `read_only_doc_view` is what makes the read-only panes predictable: they have no caret, cannot scroll horizontally, ignore Alt+Z, ignore Shift, and their arrow keys scroll rather than move an invisible cursor. Hex does not drag-select, because its layout is not the document's — `Ctrl+A` still selects everything so the text can be copied. Markdown hit-tests the layout it drew and selects like the editor; CSV selects whole records, since a cell is drawn padded into its column. Escape always returns them to the text editor.
 

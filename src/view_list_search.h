@@ -5,6 +5,28 @@
 #include "commands.h"
 #include "view_list.h"
 
+// What a result row stands for: the file it was found in, and where in that file.
+// The shared list carries it as opaque data and never looks inside it.
+struct search_row
+{
+	index_item_ptr source;
+	int line_number = -1;
+	int line_match_pos = -1;
+	int text_match_length = 0;
+};
+
+inline index_item_ptr hit_src(const list_view_item_ptr& item)
+{
+	const auto row = item ? item->as<search_row>() : nullptr;
+	return row ? row->source : nullptr;
+}
+
+inline search_row row_of(const list_view_item_ptr& item)
+{
+	const auto row = item ? item->as<search_row>() : nullptr;
+	return row ? *row : search_row{};
+}
+
 
 class search_list_view final : public list_view
 {
@@ -38,7 +60,7 @@ protected:
 	std::vector<pf::menu_command> build_context_menu_items(const list_view_item_ptr& hit)
 	{
 		std::vector<pf::menu_command> items;
-		if (!hit || !hit->source)
+		if (!hit || !hit_src(hit))
 			return items;
 
 		if (hit->is_group)
@@ -53,14 +75,13 @@ protected:
 		{
 			items.emplace_back("Open Result", 0, [this, hit]
 			{
-				_events.open_path_and_select(hit->source, hit->line_number, hit->line_match_pos,
-				                             hit->text_match_length);
+				_events.open_path_and_select(hit_src(hit), row_of(hit).line_number, row_of(hit).line_match_pos, row_of(hit).text_match_length);
 			});
 			items.emplace_back();
 		}
 
 		items.push_back(_events.command_menu_item(command_id::edit_copy, nullptr,
-		                                          [hit] { return hit && hit->source; }, nullptr,
+		                                          [hit] { return hit && hit_src(hit); }, nullptr,
 		                                          "Copy &Path"));
 		return items;
 	}
@@ -139,8 +160,7 @@ protected:
 
 		if (!item->is_group)
 		{
-			_events.open_path_and_select(item->source, item->line_number, item->line_match_pos,
-			                             item->text_match_length);
+			_events.open_path_and_select(hit_src(item), row_of(item).line_number, row_of(item).line_match_pos, row_of(item).text_match_length);
 		}
 	}
 
@@ -285,29 +305,27 @@ public:
 	list_view_item_ptr make_list_item(const index_item_ptr& item, const search_result& s)
 	{
 		const auto found = _key_to_item.find(make_key(item, s));
+		const auto row = std::make_shared<search_row>(item, s.line_number, s.line_match_pos, s.text_match_length);
+
+		// A result row shows the line it matched, prefixed by its number, with the
+		// matched run highlighted — the shared list draws that from these fields.
+		const auto fill = [&](const list_view_item_ptr& i)
+		{
+			i->data = row; // also drops the previous index_item, which would leak a whole tree
+			i->text = s.line_text;
+			i->prefix = std::format("{}: ", s.line_number + 1);
+			i->is_group = false;
+			i->match_start = s.text_match_start;
+			i->match_length = s.text_match_length;
+			return i;
+		};
 
 		if (found != _key_to_item.end())
-		{
-			found->second->source = item; // Update source to prevent memory leak
-			found->second->name = s.line_text;
-			found->second->is_group = false;
-			found->second->line_number = s.line_number;
-			found->second->line_match_pos = s.line_match_pos;
-			found->second->text_match_start = s.text_match_start;
-			found->second->text_match_length = s.text_match_length;
-			return found->second;
-		}
+			return fill(found->second);
 
 		auto i = std::make_shared<list_view_item>();
-		i->name = s.line_text;
-		i->source = item;
 		i->depth = 0;
-		i->is_group = false;
-		i->line_number = s.line_number;
-		i->line_match_pos = s.line_match_pos;
-		i->text_match_start = s.text_match_start;
-		i->text_match_length = s.text_match_length;
-		return i;
+		return fill(i);
 	}
 
 	std::string relative_path(const index_item_ptr& item) const
@@ -330,20 +348,21 @@ public:
 	list_view_item_ptr make_list_item(const index_item_ptr& item)
 	{
 		const auto found = _key_to_item.find(make_key(item));
+		const auto row = std::make_shared<search_row>(item, -1, -1, 0);
+		const auto header = std::format("{} ({})", relative_path(item),
+		                                static_cast<int>(item->search_results.size()));
 
 		if (found != _key_to_item.end())
 		{
-			found->second->source = item; // prevents keeping old index_item_ptr alive
+			found->second->data = row; // prevents keeping the old index_item tree alive
 			found->second->is_group = true;
-			found->second->name = std::format("{} ({})", relative_path(item),
-			                                  static_cast<int>(item->search_results.size()));
+			found->second->text = header;
 			return found->second;
 		}
 
 		auto i = std::make_shared<list_view_item>();
-		i->name = std::format("{} ({})", relative_path(item),
-		                      static_cast<int>(item->search_results.size()));
-		i->source = item;
+		i->text = header;
+		i->data = row;
 		i->depth = 0;
 		i->is_group = true;
 		i->expanded = true;

@@ -5,6 +5,12 @@
 #include "commands.h"
 #include "view_list.h"
 
+// Every row here stands for an index_item; the shared list carries it as opaque
+// data, and this is the one place that says what it really is.
+inline index_item_ptr src_of(const list_view_item_ptr& item)
+{
+	return item ? item->as<index_item>() : nullptr;
+}
 
 class file_list_view final : public list_view
 {
@@ -17,17 +23,17 @@ public:
 private:
 	void begin_rename(const pf::window_frame_ptr& window, const list_view_item_ptr& item)
 	{
-		if (!item || !item->source || item->is_group)
+		if (!item || !src_of(item) || item->is_group)
 			return;
 
 		_renaming_item = item;
-		_rename_input.edit.text = item->source->name;
+		_rename_input.edit.text = src_of(item)->name;
 		_rename_input.edit.sel_anchor = 0;
-		_rename_input.edit.cursor_pos = static_cast<int>(item->source->name.size());
+		_rename_input.edit.cursor_pos = static_cast<int>(src_of(item)->name.size());
 
 		// Select name without extension
-		const auto dot = pf::file_path::find_ext(item->source->name);
-		if (dot < item->source->name.size())
+		const auto dot = pf::file_path::find_ext(src_of(item)->name);
+		if (dot < src_of(item)->name.size())
 			_rename_input.edit.cursor_pos = static_cast<int>(dot);
 
 		_rename_input.update_focus(window, true);
@@ -43,8 +49,8 @@ private:
 		const auto item = _renaming_item;
 		cancel_rename(window);
 
-		if (!new_name.empty() && new_name != item->source->name)
-			_events.rename_item(item->source, new_name);
+		if (!new_name.empty() && new_name != src_of(item)->name)
+			_events.rename_item(src_of(item), new_name);
 	}
 
 	void cancel_rename(const pf::window_frame_ptr& window)
@@ -74,15 +80,15 @@ protected:
 
 		items.emplace_back();
 		items.push_back(_events.command_menu_item(command_id::edit_copy, nullptr,
-		                                          [hit] { return hit && hit->source; }, nullptr,
+		                                          [hit] { return hit && src_of(hit); }, nullptr,
 		                                          "Copy &Path"));
 		items.emplace_back("Rename", 0, [this, window]
 		                   {
 			                   begin_selected_rename(window);
-		                   }, [hit] { return hit && hit->source && !hit->source->is_folder; }, nullptr,
+		                   }, [hit] { return hit && src_of(hit) && !src_of(hit)->is_folder; }, nullptr,
 		                   pf::key_binding{pf::platform_key::F2, pf::key_mod::none});
 		items.push_back(_events.command_menu_item(command_id::edit_delete, nullptr,
-		                                          [hit] { return hit && hit->source && !hit->source->is_folder; }));
+		                                          [hit] { return hit && src_of(hit) && !src_of(hit)->is_folder; }));
 
 		return items;
 	}
@@ -149,7 +155,7 @@ protected:
 		}
 		else
 		{
-			_events.path_selected(item->source);
+			_events.path_selected(src_of(item));
 		}
 	}
 
@@ -180,6 +186,16 @@ protected:
 	}
 
 	edit_box_widget* active_edit_box() override { return is_renaming() ? &_rename_input : nullptr; }
+
+	// A file with unsaved work is red. That is application knowledge, so the shared
+	// list asks rather than assumes.
+	[[nodiscard]] pf::color_t item_text_color(const list_view_item& item) const override
+	{
+		if (item.is_group) return list_view::item_text_color(item);
+
+		const auto source = item.as<index_item>();
+		return source && _events.is_path_modified(source) ? pf::color_t{255, 80, 80} : ui::text_color;
+	}
 
 public:
 	file_list_view(app_events& events) : list_view(events)
@@ -258,12 +274,12 @@ public:
 	{
 		pf::file_path context_folder;
 
-		if (hit && hit->source)
+		if (hit && src_of(hit))
 		{
-			if (hit->source->is_folder)
-				context_folder = hit->source->path;
+			if (src_of(hit)->is_folder)
+				context_folder = src_of(hit)->path;
 			else
-				context_folder = hit->source->path.folder();
+				context_folder = src_of(hit)->path.folder();
 		}
 
 		if (!context_folder.exists())
@@ -290,7 +306,7 @@ public:
 	static bool compare_items(const list_view_item_ptr& l, const list_view_item_ptr& r)
 	{
 		if (l->is_group != r->is_group) return l->is_group > r->is_group;
-		return pf::icmp(l->name, r->name) < 0;
+		return pf::icmp(l->text, r->text) < 0;
 	}
 
 	list_view_item_ptr make_list_item(const index_item_ptr& src)
@@ -300,15 +316,15 @@ public:
 		if (found != _path_to_item.end())
 		{
 			// Update the source to point to the new index_item tree to prevent leaking the old tree
-			found->second->source = src;
-			found->second->name = src->name;
+			found->second->data = src;
+			found->second->text = src->name;
 			found->second->is_group = src->is_folder;
 			return found->second;
 		}
 
 		auto i = std::make_shared<list_view_item>();
-		i->name = src->name;
-		i->source = src;
+		i->text = src->name;
+		i->data = src;
 		i->depth = 0;
 		i->is_group = src->is_folder;
 		return i;
@@ -353,7 +369,7 @@ public:
 
 		for (int i = 0; i < static_cast<int>(_items.size()); i++)
 		{
-			if (_items[i]->source == active)
+			if (src_of(_items[i]) == active)
 			{
 				set_selected(i);
 				break;
@@ -408,7 +424,7 @@ public:
 	{
 		for (int i = 0; i < static_cast<int>(_items.size()); i++)
 		{
-			if (_items[i]->source == item)
+			if (src_of(_items[i]) == item)
 			{
 				if (_selected_item != _items[i])
 				{
@@ -429,7 +445,7 @@ public:
 
 			for (int i = 0; i < static_cast<int>(_items.size()); i++)
 			{
-				if (_items[i]->source == item)
+				if (src_of(_items[i]) == item)
 				{
 					set_selected(i);
 					ensure_visible(window, _selected_item);

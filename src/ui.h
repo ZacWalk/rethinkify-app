@@ -7,6 +7,7 @@
 #pragma once
 
 #include "ui/ui.h"
+#include "ui/view_list.h"
 
 namespace ui = pf::ui::colors;
 namespace table_layout = pf::ui::table_layout;
@@ -16,3 +17,7 @@ using pf::ui::custom_scrollbar;
 using pf::ui::edit_box;
 using pf::ui::edit_box_widget;
 using pf::ui::splitter;
+
+// A panel row. The panels hang their own object off its `data`.
+using list_view_item = pf::ui::list_item;
+using list_view_item_ptr = pf::ui::list_item_ptr;
