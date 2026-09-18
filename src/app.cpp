@@ -26,60 +26,12 @@ std::string g_app_name = "Rethinkify";
 extern std::string run_all_tests();
 extern tests::run_result run_all_tests_result();
 
+// The palette lives in platform-ui now. Phase 4 hands views a theme& directly and
+// this function goes away; until then it keeps the 47 existing call sites working.
 pf::color_t style_to_color(const style style_index)
 {
-	switch (style_index)
-	{
-	case style::white_space:
-	case style::main_wnd_clr:
-		return ui::main_wnd_clr;
-	case style::tool_wnd_clr:
-		return ui::tool_wnd_clr;
-	case style::normal_bkgnd:
-		return pf::color_t(30, 30, 30);
-	case style::normal_text:
-		return pf::color_t(222, 222, 222);
-	case style::sel_margin:
-		return pf::color_t(44, 44, 44);
-	case style::code_preprocessor:
-		return pf::color_t(133, 133, 211);
-	case style::code_comment:
-		return pf::color_t(128, 222, 128);
-	case style::code_number:
-	case style::code_string:
-		return pf::color_t(244, 244, 144);
-	case style::code_operator:
-		return pf::color_t(128, 255, 128);
-	case style::code_keyword:
-		return pf::color_t(128, 128, 255);
-	case style::sel_bkgnd:
-		return pf::color_t(88, 88, 88);
-	case style::sel_text:
-		return pf::color_t(255, 255, 255);
-	case style::error_bkgnd:
-		return pf::color_t(128, 0, 0);
-	case style::error_text:
-		return pf::color_t(255, 100, 100);
-	case style::md_heading1:
-		return pf::color_t(100, 200, 255);
-	case style::md_heading2:
-		return pf::color_t(140, 180, 255);
-	case style::md_heading3:
-		return pf::color_t(180, 160, 255);
-	case style::md_bold:
-		return pf::color_t(255, 255, 255);
-	case style::md_italic:
-		return pf::color_t(180, 220, 180);
-	case style::md_link_text:
-		return pf::color_t(100, 180, 255);
-	case style::md_link_url:
-		return pf::color_t(120, 120, 120);
-	case style::md_marker:
-		return pf::color_t(80, 80, 80);
-	case style::md_bullet:
-		return pf::color_t(200, 200, 100);
-	}
-	return pf::color_t(222, 222, 222);
+	static const pf::ui::theme palette;
+	return palette.style_color(style_index);
 }
 
 static std::string make_about_text(const commands& cmds)

@@ -3,13 +3,21 @@
 #pragma once
 
 #include "platform.h"
+#include "ui/text_types.h"
 
 class undo_group;
 class doc_view;
 class document_line;
-class text_location;
 class view_base;
 class document_events;
+
+// The text vocabulary lives in platform-ui, which owns the views that consume it.
+// These aliases keep this header the place the document model names them from.
+using text_location = pf::ui::text_location;
+using text_selection = pf::ui::text_selection;
+using style = pf::ui::text_style;
+using text_block = pf::ui::text_block;
+using highlight_fn = pf::ui::highlight_fn;
 
 constexpr auto invalid_length = -1;
 constexpr uint32_t invalid_cookie = UINT32_MAX;
@@ -42,49 +50,6 @@ enum class doc_type
 	hex,
 	csv,
 };
-
-enum class style
-{
-	main_wnd_clr,
-	tool_wnd_clr,
-
-	white_space,
-	normal_bkgnd,
-	normal_text,
-
-	sel_margin,
-	sel_bkgnd,
-	sel_text,
-
-	error_bkgnd,
-	error_text,
-
-	code_keyword,
-	code_comment,
-	code_number,
-	code_operator,
-	code_string,
-	code_preprocessor,
-
-	md_heading1,
-	md_heading2,
-	md_heading3,
-	md_bold,
-	md_italic,
-	md_link_text,
-	md_link_url,
-	md_marker,
-	md_bullet,
-};
-
-struct text_block
-{
-	int _char_pos;
-	style _color;
-};
-
-using highlight_fn = std::function<uint32_t(uint32_t dwCookie, std::string_view line_view, text_block* pBuf,
-                                            int& nActualItems)>;
 
 
 enum class line_endings
@@ -141,76 +106,6 @@ struct loaded_file_data
 };
 
 loaded_file_data load_lines(const pf::file_path& path);
-
-class text_location
-{
-public:
-	int x = 0;
-	int y = 0;
-
-	constexpr text_location(const int xx = 0, const int yy = 0) : x(xx), y(yy)
-	{
-	}
-
-	bool operator==(const text_location& other) const = default;
-
-	auto operator<=>(const text_location& other) const
-	{
-		if (const auto cmp = y <=> other.y; cmp != 0) return cmp;
-		return x <=> other.x;
-	}
-};
-
-class text_selection
-{
-public:
-	text_location _start;
-	text_location _end;
-
-	text_selection() = default;
-
-	text_selection(const text_location& start, const text_location& end) : _start(start), _end(end)
-	{
-	}
-
-	text_selection(const text_location& loc) : _start(loc), _end(loc)
-	{
-	}
-
-	text_selection(const int x1, const int y1, const int x2, const int y2) : _start(x1, y1), _end(x2, y2)
-	{
-	}
-
-	bool operator==(const text_selection& other) const = default;
-
-	[[nodiscard]] bool empty() const
-	{
-		return _start == _end;
-	}
-
-	[[nodiscard]] bool is_valid() const
-	{
-		return _start.x >= 0 && _start.y >= 0 && _end.x >= 0 && _end.y >= 0;
-	}
-
-	[[nodiscard]] text_selection normalize() const
-	{
-		text_selection result;
-
-		if (_start < _end)
-		{
-			result._start = _start;
-			result._end = _end;
-		}
-		else
-		{
-			result._start = _end;
-			result._end = _start;
-		}
-
-		return result;
-	}
-};
 
 class document_line
 {

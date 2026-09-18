@@ -3,11 +3,15 @@
 #pragma once
 
 #include "platform.h"
+#include "ui/text_types.h"
+#include "ui/theme.h"
+#include "ui/view_host.h"
 
-class text_location;
 class document;
 using document_ptr = std::shared_ptr<document>;
 enum class command_id : int;
+
+using text_location = pf::ui::text_location;
 
 enum class view_content : int
 {
@@ -175,46 +179,24 @@ enum class spell_check_mode
 
 // document_events — Narrow interface for document-to-host notifications.
 // The document model depends only on this, not the full app_events.
-class document_events
+//
+// The line-level half is pf::ui::view_host, so a platform-ui view can be hosted
+// here without knowing what an `invalid::` bit is.
+class document_events : public pf::ui::view_host
 {
 public:
-	virtual ~document_events() = default;
-
 	virtual void invalidate(uint32_t i) = 0;
-	// Repaint only — the text of these lines is unchanged
-	virtual void invalidate_lines(int start, int end) = 0;
-	// The text of these lines changed, so layout and highlighting must be redone
-	virtual void lines_changed(int start, int end) = 0;
-	// Lines were inserted after 'at' (delta > 0) or erased from 'at' + 1 (delta < 0).
-	// The text of line 'at' changed too.
-	virtual void line_count_changed(int at, int delta) = 0;
-	virtual void ensure_visible(const text_location& pt) = 0;
+
+	// view_host's neutral spelling of "redraw everything about the document".
+	void invalidate_view() override { invalidate(invalid::doc); }
 };
 
-struct view_styles
+// view_styles — the app's theme. The fonts, metrics and palette come from
+// pf::ui::theme; this adds only what the agent pane needs on top.
+struct view_styles : pf::ui::theme
 {
-	double dpi_scale = 1.0;
-
-	int list_font_height = 20;
-	int text_font_height = 24;
 	int agent_font_height = 20;
-
-	pf::font list_font = {20, pf::font_name::calibri};
-	pf::font edit_font = {30, pf::font_name::calibri};
-	pf::font text_font = {24, pf::font_name::consolas};
 	pf::font agent_font = {20, pf::font_name::consolas};
-
-	int padding_x = 5;
-	int padding_y = 5;
-	int indent = 16;
-
-	// Edit box / input field layout (DPI-scaled)
-	int edit_box_margin = 6;
-	int edit_box_inner_pad = 4;
-
-	// List view layout
-	int list_top_pad = 4;
-	int list_scroll_pad = 64;
 };
 
 enum class zoom_target { text, list, agent };
