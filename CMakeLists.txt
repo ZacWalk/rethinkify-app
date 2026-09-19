@@ -28,7 +28,7 @@ endif()
 include(FetchContent)
 FetchContent_Declare(platform_h
     GIT_REPOSITORY https://github.com/ZacWalk/platform-h.git
-    GIT_TAG        a926913236327fe7eb1aee31fec2f865cf08bccb
+    GIT_TAG        3ce2e00a97c3f3da2a21e5f16e281b1d25a7823e
 )
 FetchContent_MakeAvailable(platform_h)
 
