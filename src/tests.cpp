@@ -3071,12 +3071,12 @@ static void should_grow_agent_input_to_five_rows()
 
 	view->set_text("1\n2\n3\n4\n5");
 	view->layout();
-	should::is_equal(agent_input_view::max_rows, view->rows(), "five lines");
+	should::is_equal(pf::ui::composer::default_max_rows, view->rows(), "five lines");
 
 	// Beyond the cap the box stops growing and the text scrolls instead
 	view->set_text("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
 	view->layout();
-	should::is_equal(agent_input_view::max_rows, view->rows(), "capped at five");
+	should::is_equal(pf::ui::composer::default_max_rows, view->rows(), "capped at five");
 
 	view->handle_size(window, pf::isize{400, view->desired_height()}, measure);
 	should::is_equal_true(view->vert_scrollbar().can_scroll(), "scrolls past the cap");
