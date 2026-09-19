@@ -564,7 +564,13 @@ app_state::app_state(async_scheduler_ptr scheduler) : _doc_view(make_edit_doc_vi
 	_agent_input_doc_events = std::make_shared<agent_input_doc_events>(*this);
 	_agent_input_doc = std::make_shared<document>(*_agent_input_doc_events);
 	_agent_input_view->set_buffer(_agent_input_doc, highlight_for(_agent_input_doc));
-	_agent_input_view->on_submit = [this](std::string text) { on_agent_input(std::move(text)); };
+	// This application always takes what it is given; the composer keeps a prompt
+	// its handler refuses, which is what list0's disclosure gate needs.
+	_agent_input_view->on_submit = [this](std::string text)
+	{
+		on_agent_input(std::move(text));
+		return true;
+	};
 
 	_agent_view->on_answer = [this](const size_t index) { on_agent_answer(index); };
 	_agent_view->on_type = [this](const char32_t ch) { type_into_agent_input(ch); };
