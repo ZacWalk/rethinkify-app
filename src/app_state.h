@@ -95,6 +95,15 @@ public:
 	[[nodiscard]] index_item_ptr session_item();
 	[[nodiscard]] pf::irect agent_splitter_bounds(const pf::irect& bounds) const;
 
+	// Where every pane lands for a given client area. Separate from layout_views so
+	// the arithmetic can be swept across window sizes without a window to produce them.
+	struct pane_bounds
+	{
+		pf::irect panel, document, agent, agent_input;
+	};
+
+	[[nodiscard]] pane_bounds layout_bounds(const pf::irect& bounds) const;
+
 	index_item_ptr _session_item;
 	std::shared_ptr<document_events> _agent_doc_events;
 	std::shared_ptr<document_events> _agent_input_doc_events;

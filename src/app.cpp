@@ -1706,19 +1706,18 @@ pf::irect app_state::agent_splitter_bounds(const pf::irect& bounds) const
 	return rest;
 }
 
-void app_state::layout_views() const
+app_state::pane_bounds app_state::layout_bounds(const pf::irect& bounds) const
 {
-	if (!_app_window)
-		return;
-
-	const auto is_list_visible = _list_window && _list_window->is_visible();
-	const auto bounds = _app_window->get_client_rect();
+	pane_bounds result;
 	const auto panel_split = _panel_splitter.split_pos(bounds);
 
 	auto text_bounds = bounds;
-	text_bounds.left = panel_split + _panel_splitter.bar_width();
+	// A splitter bar is a fixed number of pixels while its split is a fraction of the
+	// width, so below some width the bar is wider than the pane beside it. Clamping
+	// leaves an empty pane; not clamping reaches MoveWindow as a negative width.
+	text_bounds.left = std::min(panel_split + _panel_splitter.bar_width(), bounds.right);
 
-	if (_agent_visible && _agent_window)
+	if (_agent_visible)
 	{
 		const auto agent_split = _agent_splitter.split_pos(agent_splitter_bounds(bounds));
 		text_bounds.right = std::max(text_bounds.left, agent_split - _agent_splitter.bar_width());
@@ -1732,20 +1731,41 @@ void app_state::layout_views() const
 		                              agent_bounds.top, agent_bounds.bottom);
 		agent_bounds.bottom = input_bounds.top;
 
-		_agent_window->move_window(agent_bounds);
-
-		if (_agent_input_window)
-			_agent_input_window->move_window(input_bounds);
+		result.agent = agent_bounds;
+		result.agent_input = input_bounds;
 	}
 
-	_doc_window->move_window(text_bounds);
+	result.document = text_bounds;
 
 	auto panel_bounds = bounds;
-	panel_bounds.right = panel_split - _panel_splitter.bar_width();
+	panel_bounds.right = std::max(bounds.left, panel_split - _panel_splitter.bar_width());
+	result.panel = panel_bounds;
+
+	return result;
+}
+
+void app_state::layout_views() const
+{
+	if (!_app_window)
+		return;
+
+	const auto is_list_visible = _list_window && _list_window->is_visible();
+	const auto bounds = _app_window->get_client_rect();
+	const auto panes = layout_bounds(bounds);
+
+	if (_agent_visible && _agent_window)
+	{
+		_agent_window->move_window(panes.agent);
+
+		if (_agent_input_window)
+			_agent_input_window->move_window(panes.agent_input);
+	}
+
+	_doc_window->move_window(panes.document);
 
 	if (is_list_visible)
 	{
-		_list_window->move_window(panel_bounds);
+		_list_window->move_window(panes.panel);
 	}
 }
 

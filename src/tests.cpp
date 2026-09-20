@@ -2929,6 +2929,55 @@ static void should_ignore_unknown_updates()
 	should::is_equal(size_t{0}, lines.size(), "nothing written");
 }
 
+// Every pane rectangle has to survive every window size, not just a comfortable one.
+// A rectangle that inverts reaches MoveWindow as a negative width.
+static void should_keep_every_pane_valid_at_any_window_size()
+{
+	const auto state = create_test_app();
+
+	const auto check_panes = [&](const pf::irect& bounds, const char* where)
+	{
+		const auto panes = state->layout_bounds(bounds);
+		const std::pair<const pf::irect*, const char*> all[] = {
+			{&panes.panel, "panel"}, {&panes.document, "document"},
+			{&panes.agent, "agent"}, {&panes.agent_input, "prompt"}};
+
+		for (const auto& [rect, name] : all)
+		{
+			// The agent rectangles are left empty when the panel is hidden.
+			if (!state->_agent_visible && (name[0] == 'a' || name[0] == 'p') &&
+				rect->left == 0 && rect->right == 0 && rect->bottom == 0)
+				continue;
+
+			should::is_equal_true(rect->right >= rect->left,
+			                      std::format("{} pane never inverts horizontally {}", name, where));
+			should::is_equal_true(rect->bottom >= rect->top,
+			                      std::format("{} pane never inverts vertically {}", name, where));
+			should::is_equal_true(rect->left >= bounds.left && rect->right <= bounds.right,
+			                      std::format("{} pane stays inside the window {}", name, where));
+		}
+	};
+
+	for (const auto visible : {false, true})
+	{
+		state->_agent_visible = visible;
+		for (const auto ratio : {splitter::min_ratio, 0.2, 0.5, 0.72, splitter::max_ratio})
+		{
+			state->_panel_splitter._ratio = ratio;
+			state->_agent_splitter._ratio = ratio;
+
+			// Narrow windows are the interesting ones: a splitter bar is a fixed
+			// number of pixels while the split itself is a fraction of the width,
+			// so below some width the bar is wider than the pane beside it.
+			for (int width = 0; width <= 320; ++width)
+				check_panes(pf::irect{0, 0, width, 600}, "in a narrow window");
+
+			for (const auto height : {0, 1, 8, 600})
+				check_panes(pf::irect{0, 0, 1000, height}, "in a short window");
+		}
+	}
+}
+
 // The document pane must keep at least a usable width however the splitters are dragged
 static void should_clamp_agent_splitter_to_the_document_pane()
 {
@@ -4412,6 +4461,8 @@ tests::run_result run_all_tests_result(){
 	// Agent panel tests
 	tests.register_test("should clamp agent splitter to the document pane",
 	                    should_clamp_agent_splitter_to_the_document_pane);
+	tests.register_test("should keep every pane valid at any window size",
+	                    should_keep_every_pane_valid_at_any_window_size);
 	tests.register_test("should keep the scrollbar thumb inside the track",
 	                    should_keep_the_scrollbar_thumb_inside_the_track);
 	tests.register_test("should scroll the agent transcript", should_scroll_the_agent_transcript);
