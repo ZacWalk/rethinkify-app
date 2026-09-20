@@ -27,7 +27,7 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 | Application | `app.h`, `app.cpp` (main window, panes, splitters, document index, search, session), `app_state.h` (state and testable logic) |
 | Commands | `commands.h`, `commands.cpp` (`command_def` and lookup), `app_commands.cpp` (the command table and menu builder) |
 | Text model | `document.h`, `document.cpp` (a `pf::ui::text_buffer` that knows its path, encoding, line endings, load/save, JSON reformat, sort), `document_syntax.cpp` (which highlighter a document gets) |
-| Document views | `view_base.h`, `view_text.h`, `view_doc.h`, `view_doc_edit.h`, `view_doc_readonly.h`, `view_doc_markdown.h`, `view_doc_csv.h` and `view_doc_hex.h` name the shared `pf::ui` views under this application's names; `view_agent.h` and `view_agent_input.h` are still this application's own |
+| Document views | `view_base.h`, `view_text.h`, `view_doc.h`, `view_doc_edit.h`, `view_doc_readonly.h`, `view_doc_markdown.h`, `view_doc_csv.h` and `view_doc_hex.h` name the shared `pf::ui` views under this application's names; `view_agent.h` and `view_agent_input.h` are still this application's own. The shared views handle Ctrl+A/C/X/V themselves, for applications that have no menu behind them — here the accelerator table answers first, so nothing is handled twice |
 | Panel views | `view_list.h` names the shared `pf::ui::list_view`; `view_list_files.h` and `view_list_search.h` are this application's own, and hang an `index_item` or a search hit off each row's `data` |
 | Agent | `acp.h`/`acp.cpp` (Agent Client Protocol), `agent_session.h`/`.cpp` (`session.md` format, slash commands), `agent_host.h`/`.cpp` (process, turn, permissions) |
 | Widgets | `ui.h` (the `pf::ui` widgets under this application's names: `edit_box`, `caret_blinker`, `splitter`, `custom_scrollbar`) |
@@ -38,6 +38,8 @@ Rethinkify is a lightweight Windows text editor for research across folders of t
 ## Adding a command
 
 Add one entry to the table in `app_state::make_commands` (`app_commands.cpp`): description, menu text, `command_id`, accelerator, optional enabled/checked predicates, and the lambda. That single entry drives the menu item, its enable/check state, the runtime accelerator and the generated About document. Do not introduce a parallel dispatch table, and do not also handle the key in a view — the accelerator table consumes it first, so the view branch would be dead code. A second binding for the same command goes in `accel_alt`.
+
+The shared `pf::ui` views are the one exception, and they are not a counterexample: `text_view` handles Ctrl+A/C/X/V because an application with no menu — list0's prompt, equity's agent panel — would otherwise have no way to copy. Those keys never reach a view here, for exactly the reason above. If a shared view appears to handle a command this application also binds, the accelerator wins and the view's branch is unreachable; do not "fix" that by removing the binding.
 
 Global accelerators fire regardless of focus, so a command that acts on "the selection" must decide what the focused pane means — the editor, the file list, or an inline edit box.
 
