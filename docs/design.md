@@ -27,7 +27,7 @@ The platform layer lives in the shared [libdesktop](https://github.com/ZacWalk/l
 
 ### Build tooling
 
-The unmodified [dd 0.2.4](https://github.com/ZacWalk/dd/releases/tag/v0.2.4)
+The unmodified [dd 0.2.5](https://github.com/ZacWalk/dd/releases/tag/v0.2.5)
 runtime is vendored in `dd.ps1` and `.dd/`, with its upstream revision and file
 hashes recorded in `docs/dd-upstream.json`. It is developer tooling, not an
 application dependency. `dd.psd1` maps the Debug/Release presets and executable

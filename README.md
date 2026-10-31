@@ -33,7 +33,7 @@ dd itself needs [PowerShell 7.4](https://github.com/PowerShell/PowerShell) (`pws
 ## Building
 
 Requires Windows x64 and Visual Studio with the Desktop C++ workload. The
-vendored [dd 0.2.4](https://github.com/ZacWalk/dd/releases/tag/v0.2.4) runtime
+vendored [dd 0.2.5](https://github.com/ZacWalk/dd/releases/tag/v0.2.5) runtime
 locates Visual Studio and uses the CMake and Ninja that ship with it.
 
 ```powershell

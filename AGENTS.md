@@ -75,7 +75,7 @@ Run the repository gate after changes here:
 The filtered gate builds both configurations and runs the CTest tests carrying
 the `unit` label, without dd's separate desktop smoke test.
 
-dde vendors the [dd 0.2.4](https://github.com/ZacWalk/dd/releases/tag/v0.2.4)
+dde vendors the [dd 0.2.5](https://github.com/ZacWalk/dd/releases/tag/v0.2.5)
 build driver unmodified as `dd.ps1` and `.dd/`, with file hashes recorded in
 [docs/dd-upstream.json](docs/dd-upstream.json). Project settings live in
 `dd.psd1`; CMake owns the libdesktop dependency pin
